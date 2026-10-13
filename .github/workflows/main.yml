@@ -1,0 +1,86 @@
+name: Build Craft Apps (Windows x64)
+
+on:
+  # 允许手动触发
+  workflow_dispatch:
+    inputs:
+      build_photocraft:
+        description: 'Build PhotoCraft'
+        required: true
+        default: true
+        type: boolean
+      build_cadcraft:
+        description: 'Build CADCraft'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    name: Build on Windows x64
+    runs-on: windows-latest
+    
+    # 如果需要构建的仓库是私有的，需要在此处配置权限或使用个人访问令牌
+    # 对于公开仓库，默认的 GITHUB_TOKEN 即可克隆
+    
+    steps:
+      - name: Checkout your repository
+        uses: actions/checkout@v4
+
+      # --- 构建 PhotoCraft ---
+      - name: Checkout PhotoCraft
+        if: ${{ inputs.build_photocraft }}
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/photocraft
+          path: ./photocraft
+          # 建议锁定一个稳定的标签或提交，例如 ref: 'v0.8.2'
+          ref: 'main' 
+
+      - name: Setup Rust
+        if: ${{ inputs.build_photocraft || inputs.build_cadcraft }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build PhotoCraft
+        if: ${{ inputs.build_photocraft }}
+        working-directory: ./photocraft
+        run: |
+          # 根据 README，桌面应用包名为 photocraft
+          cargo build --release -p photocraft --target x86_64-pc-windows-msvc
+        # 注意：PhotoCraft README 提到可选字体输入 craft-fonts，若需要可克隆并设置 CRAFT_FONTS_DIR
+
+      - name: Upload PhotoCraft Artifact
+        if: ${{ inputs.build_photocraft }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-windows-x64
+          path: ./photocraft/target/x86_64-pc-windows-msvc/release/photocraft.exe
+          # 如果还有 CLI 工具，可一并上传：photocraft-cli.exe
+
+      # --- 构建 CADCraft ---
+      - name: Checkout CADCraft
+        if: ${{ inputs.build_cadcraft }}
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/cadcraft
+          path: ./cadcraft
+          ref: 'main'
+
+      - name: Build CADCraft
+        if: ${{ inputs.build_cadcraft }}
+        working-directory: ./cadcraft
+        run: |
+          # README 中桌面应用包名为 cadcraft
+          cargo build --release -p cadcraft --target x86_64-pc-windows-msvc
+          # 可选：同时构建 CLI 工具
+          # cargo build --release -p cadcraft-cli --target x86_64-pc-windows-msvc
+
+      - name: Upload CADCraft Artifact
+        if: ${{ inputs.build_cadcraft }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cadcraft-windows-x64
+          path: ./cadcraft/target/x86_64-pc-windows-msvc/release/cadcraft.exe
+          # 如果构建了 CLI，可一并上传：cadcraft-cli.exe
