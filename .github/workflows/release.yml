@@ -1,0 +1,256 @@
+# =============================================================================
+# Build Upstream Repos - Windows x64 only (no Linux/macOS matrix)
+#
+# Targets (verified 2026-10-13):
+#   - storytold/photocraft : pure-Rust image editor (Cargo workspace, rust 1.95)
+#                             main app package: apps/photocraft -> photocraft.exe
+#   - storytold/cadcraft   : pure-Rust CAD app      (Cargo workspace, rust 1.90,
+#                             desktop/web UI builds require 1.95+)
+#                             main package: cadcraft -> cadcraft.exe
+#
+# NOTE: Neither repo uses Node.js / npm / pnpm / Electron. The only toolchain
+# required is Rust (MSVC host triple on windows-latest). Trunk + wasm32 target
+# are only needed for the optional web builds and are NOT part of this flow.
+#
+# Trigger: manual only (workflow_dispatch).
+#   - build_photocraft / build_cadcraft : build each repo independently
+#   - clean_cache                       : skip restoring AND saving the Cargo cache
+#   - rust_toolchain                    : Rust toolchain (stable >= 1.95 works)
+#
+# Behavior on failure: jobs are independent (parallel by default); one failing
+# does not cancel the other. Each job always uploads its build log (even on
+# failure) and prints the log tail; the final "summary" job always runs and
+# writes a result table to the run summary.
+# =============================================================================
+
+name: Build Upstream (Windows x64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_photocraft:
+        description: "Build storytold/photocraft"
+        type: boolean
+        default: true
+      build_cadcraft:
+        description: "Build storytold/cadcraft"
+        type: boolean
+        default: true
+      clean_cache:
+        description: "Do not restore or save the Cargo build cache"
+        type: boolean
+        default: false
+      rust_toolchain:
+        description: "Rust toolchain version (cadcraft desktop needs >= 1.95)"
+        type: string
+        default: "stable"
+
+# Prevent overlapping runs of the same workflow on the same ref.
+concurrency:
+  group: build-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # Both repos pull git dependencies from github.com/storytold/craft-libs.
+  # Using the git CLI is more reliable on Windows runners than libgit2.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  # ===========================================================================
+  # Job 1: photocraft (Rust image editor)
+  # ===========================================================================
+  build-photocraft:
+    name: "photocraft (windows-latest, x64)"
+    if: ${{ inputs.build_photocraft }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout storytold/photocraft
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/photocraft
+          ref: main
+          path: photocraft
+          # Both repos are public, so no token is needed. If either repo ever
+          # becomes private, add: token: ${{ secrets.UPSTREAM_PAT }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ inputs.rust_toolchain }}
+          # Explicit host triple; windows-latest defaults to this anyway.
+          targets: x86_64-pc-windows-msvc
+
+      # Cache ~/.cargo registry + target dir, keyed per repo/platform.
+      # Skipped entirely when clean_cache is true (fresh, uncached build).
+      - name: Cache Cargo registry and build
+        if: ${{ !inputs.clean_cache }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: photocraft
+          key: photocraft-windows-x64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build release binary (cargo build --release -p photocraft)
+        working-directory: photocraft
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Tee full output to build.log so it survives into the artifact.
+          cargo build --release --locked -p photocraft *>&1 |
+            Tee-Object -FilePath build.log
+          $code = $LASTEXITCODE
+          Write-Host "cargo build exit code: $code"
+          if ($code -ne 0) { exit $code }
+          # Sanity check: expected output binary.
+          if (-not (Test-Path 'target/release/photocraft.exe')) {
+            Write-Error 'photocraft.exe not found under target/release/'
+            exit 1
+          }
+
+      - name: Collect artifacts
+        if: ${{ always() }}
+        working-directory: photocraft
+        shell: pwsh
+        run: |
+          $stage = '../artifacts/photocraft'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item 'target/release/photocraft.exe' $stage -ErrorAction SilentlyContinue
+          if (Test-Path 'target/release/photocraft.pdb') {
+            Copy-Item 'target/release/photocraft.pdb' $stage
+          }
+          if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
+
+      - name: Upload artifact (photocraft-windows-x64)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-windows-x64
+          path: artifacts/photocraft/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Print build log tail on failure
+        if: ${{ failure() }}
+        working-directory: photocraft
+        shell: pwsh
+        run: |
+          if (Test-Path 'build.log') {
+            Write-Host '----- build.log (last 200 lines) -----'
+            Get-Content 'build.log' -Tail 200
+          }
+
+  # ===========================================================================
+  # Job 2: cadcraft (Rust CAD app) - identical structure, runs in parallel.
+  # To serialize after photocraft instead, add:
+  #   needs: build-photocraft
+  # ===========================================================================
+  build-cadcraft:
+    name: "cadcraft (windows-latest, x64)"
+    if: ${{ inputs.build_cadcraft }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout storytold/cadcraft
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/cadcraft
+          ref: main
+          path: cadcraft
+          # Add token: ${{ secrets.UPSTREAM_PAT }} if the repo is private.
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ inputs.rust_toolchain }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo registry and build
+        if: ${{ !inputs.clean_cache }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cadcraft
+          key: cadcraft-windows-x64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build release binary (cargo build --release -p cadcraft)
+        working-directory: cadcraft
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked -p cadcraft *>&1 |
+            Tee-Object -FilePath build.log
+          $code = $LASTEXITCODE
+          Write-Host "cargo build exit code: $code"
+          if ($code -ne 0) { exit $code }
+          if (-not (Test-Path 'target/release/cadcraft.exe')) {
+            Write-Error 'cadcraft.exe not found under target/release/'
+            exit 1
+          }
+
+      - name: Collect artifacts
+        if: ${{ always() }}
+        working-directory: cadcraft
+        shell: pwsh
+        run: |
+          $stage = '../artifacts/cadcraft'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item 'target/release/cadcraft.exe' $stage -ErrorAction SilentlyContinue
+          if (Test-Path 'target/release/cadcraft.pdb') {
+            Copy-Item 'target/release/cadcraft.pdb' $stage
+          }
+          if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
+
+      - name: Upload artifact (cadcraft-windows-x64)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cadcraft-windows-x64
+          path: artifacts/cadcraft/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Print build log tail on failure
+        if: ${{ failure() }}
+        working-directory: cadcraft
+        shell: pwsh
+        run: |
+          if (Test-Path 'build.log') {
+            Write-Host '----- build.log (last 200 lines) -----'
+            Get-Content 'build.log' -Tail 200
+          }
+
+  # ===========================================================================
+  # Job 3: always-on summary (runs even if a build job fails)
+  # ===========================================================================
+  summary:
+    name: "Build summary"
+    needs: [build-photocraft, build-cadcraft]
+    if: ${{ always() }}
+    runs-on: windows-latest
+    steps:
+      - name: Write result table to $GITHUB_STEP_SUMMARY
+        shell: pwsh
+        run: |
+          $pc = '${{ needs.build-photocraft.result }}'
+          $cc = '${{ needs.build-cadcraft.result }}'
+          $lines = @(
+            '## Upstream build results (Windows x64)',
+            '',
+            '| Job | Result | Artifact |',
+            '| --- | ------ | -------- |',
+            "| photocraft | $pc | photocraft-windows-x64 |",
+            "| cadcraft | $cc | cadcraft-windows-x64 |",
+            ''
+          )
+          if ($pc -eq 'failure' -or $cc -eq 'failure') {
+            $lines += 'At least one build FAILED - see the failed job log and the build.log inside its artifact.'
+          } elseif ($pc -eq 'skipped' -and $cc -eq 'skipped') {
+            $lines += 'Both builds were skipped via workflow_dispatch inputs.'
+          } else {
+            $lines += 'All requested builds succeeded. Download artifacts from the run page.'
+          }
+          $lines -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
