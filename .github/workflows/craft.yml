@@ -1,5 +1,5 @@
 # =============================================================================
-# Build Upstream Repos - Windows x64 only (no Linux/macOS matrix)
+# Build Upstream craft Repos - Windows x64 only (no Linux/macOS matrix)
 #
 # Targets (verified 2026-10-13):
 #   - storytold/photocraft : pure-Rust image editor (Cargo workspace, rust 1.95)
