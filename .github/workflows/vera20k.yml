@@ -45,7 +45,10 @@ jobs:
         include:
           - os: windows-latest
             target: windows-x64
-            program: vera20k.exe
+    # Surface Cargo.toml metadata to dependent jobs (publish uses pkg_name).
+    outputs:
+      pkg_name: ${{ steps.meta.outputs.name }}
+      pkg_version: ${{ steps.meta.outputs.version }}
     defaults:
       run:
         # The source checkout lands at the workspace root, so all cargo/paths
@@ -61,13 +64,26 @@ jobs:
       - name: Check out with LF line endings
         if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
+      - name: Read package metadata from Cargo.toml
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Read [package] name/version from the SOURCE repo's Cargo.toml at root.
+          name="$(sed -n 's/^name = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$name" ] || [ -z "$version" ]; then
+            echo "Failed to read name/version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Require the ref to match the Cargo.toml version
         if: startsWith(github.event.inputs.ref, 'v')
         shell: bash
         run: |
-          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          if [ "${{ github.event.inputs.ref }}" != "v$version" ]; then
-            echo "Ref ${{ github.event.inputs.ref }} does not match Cargo.toml version $version (expected v$version)" >&2
+          if [ "v${{ steps.meta.outputs.version }}" != "${{ github.event.inputs.ref }}" ]; then
+            echo "Ref ${{ github.event.inputs.ref }} does not match Cargo.toml version ${{ steps.meta.outputs.version }} (expected v${{ steps.meta.outputs.version }})" >&2
             exit 1
           fi
       - uses: dtolnay/rust-toolchain@stable
@@ -82,20 +98,24 @@ jobs:
             -o dist/THIRD_PARTY_LICENSES.html .github/release/about.hbs
       - uses: Swatinem/rust-cache@v2
       - name: Build the game
-        run: cargo build --release --locked --bin vera20k
+        run: cargo build --release --locked --bin ${{ steps.meta.outputs.name }}
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
+          name="${{ steps.meta.outputs.name }}"
+          cv="${{ steps.meta.outputs.version }}"
           ref="${{ github.event.inputs.ref }}"
-          version="${ref//\//-}"
-          name="vera20k-$version-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp "target/release/${{ matrix.program }}" config.toml.example LICENSE-GPL \
-            dist/THIRD_PARTY_LICENSES.html "dist/$name/"
-          sed "s/@VERSION@/$version/" .github/release/README.txt.in > "dist/$name/README.txt"
-          cd "dist/$name"
-          7z a -tzip "../$name.zip" ./* > /dev/null
+          # Archive version: keep the `v` prefix when building a tag (matches the
+          # release tag), otherwise use the bare Cargo.toml version.
+          if [[ "$ref" == v* ]]; then arc_ver="v$cv"; else arc_ver="$cv"; fi
+          pkgname="$name-$arc_ver-${{ matrix.target }}"
+          mkdir -p "dist/$pkgname"
+          cp "target/release/$name.exe" config.toml.example LICENSE-GPL \
+            dist/THIRD_PARTY_LICENSES.html "dist/$pkgname/"
+          sed "s/@VERSION@/$arc_ver/" .github/release/README.txt.in > "dist/$pkgname/README.txt"
+          cd "dist/$pkgname"
+          7z a -tzip "../$pkgname.zip" ./* > /dev/null
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
@@ -122,7 +142,7 @@ jobs:
           merge-multiple: true
       - uses: actions/attest@v4
         with:
-          subject-path: dist/vera20k-*
+          subject-path: dist/${{ needs.build.outputs.pkg_name }}-*
       - name: Create the pre-release in THIS repository
         env:
           # Default token can write to the workflow repo itself; no PAT needed.
@@ -130,10 +150,10 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum vera20k-* > SHA256SUMS.txt
+          sha256sum ${{ needs.build.outputs.pkg_name }}-* > SHA256SUMS.txt
           # The build ref (e.g. v0.1.0) belongs to the SOURCE repo (vera20k), not
           # this workflow repo, so we do NOT use --verify-tag: gh will create the
           # tag in this repo from its default branch. The release artifacts still
           # come from the vera20k source we checked out.
           gh release create "${{ github.event.inputs.ref }}" \
-            --prerelease --generate-notes --title "VERA20K ${{ github.event.inputs.ref }}" ./*
+            --prerelease --generate-notes --title "${{ needs.build.outputs.pkg_name }} ${{ github.event.inputs.ref }}" ./*
