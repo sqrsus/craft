@@ -13,9 +13,10 @@
 # are only needed for the optional web builds and are NOT part of this flow.
 #
 # MSI packaging: after the release build, each job compiles an MSI with the
-# WiX Toolset v3 (downloaded from the official release, pinned to 3.14.1). A
-# generic installer/installer.wxs template in THIS repo is filled via candle
-# preprocessor variables. Output: artifacts/<repo>/<App>-<ver>-x86_64.msi
+# WiX Toolset v3 (downloaded from the official release, pinned to 3.14.1). The
+# WiX source is GENERATED INLINE inside the step (so the build never depends on a
+# separately committed file being present), then filled via candle preprocessor
+# variables. Output: artifacts/<repo>/<pkg>-<ver>-windows-x64.msi
 #
 # Trigger: manual only (workflow_dispatch).
 #   - build_photocraft / build_cadcraft : build each repo independently
@@ -78,11 +79,6 @@ jobs:
     if: ${{ inputs.build_photocraft }}
     runs-on: windows-latest
     steps:
-      - name: Checkout workflow repo (provides installer/ template)
-        uses: actions/checkout@v4
-        # No repository specified -> checks out THIS repo at the triggering ref,
-        # giving the job access to installer/installer.wxs used for MSI builds.
-
       - name: Checkout storytold/photocraft
         uses: actions/checkout@v4
         with:
@@ -109,20 +105,26 @@ jobs:
           key: photocraft-windows-x64
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release binary (cargo build --release -p photocraft)
+      - name: Build release binaries (cargo build --release -p photocraft -p photocraft-cli --features heif)
         working-directory: photocraft
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Tee full output to build.log so it survives into the artifact.
-          cargo build --release --locked -p photocraft *>&1 |
+          # Match the source repo's packaging: build the GUI app AND the CLI, with the
+          # static CRT so the MSI/portable build needs no Visual C++ redistributable.
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
+          cargo build --release --locked -p photocraft -p photocraft-cli --features heif *>&1 |
             Tee-Object -FilePath build.log
           $code = $LASTEXITCODE
           Write-Host "cargo build exit code: $code"
           if ($code -ne 0) { exit $code }
-          # Sanity check: expected output binary.
+          # Sanity check: both expected output binaries must exist.
           if (-not (Test-Path 'target/release/photocraft.exe')) {
             Write-Error 'photocraft.exe not found under target/release/'
+            exit 1
+          }
+          if (-not (Test-Path 'target/release/photocraft-cli.exe')) {
+            Write-Error 'photocraft-cli.exe not found under target/release/'
             exit 1
           }
 
@@ -161,6 +163,7 @@ jobs:
         env:
           APP_NAME: PhotoCraft
           EXE_NAME: photocraft.exe
+          CLI_EXE_NAME: photocraft-cli.exe
           PKG_NAME: photocraft
           UPGRADE_GUID: "{A1B2C3D4-1111-2222-3333-444455556666}"
         run: |
@@ -177,18 +180,65 @@ jobs:
           $parts = ($ver.Split('.') | Select-Object -First 3)
           while ($parts.Count -lt 3) { $parts += '0' }
           $ver = $parts -join '.'
-          $msi = "artifacts/$repo/$env:APP_NAME-$ver-x86_64.msi"
+          # Match the source repo's MSI naming: <pkg>-<version>-windows-x64.msi
+          $msi = "artifacts/$repo/$env:PKG_NAME-$ver-windows-x64.msi"
           New-Item -ItemType Directory -Force -Path "artifacts/$repo" | Out-Null
-          # Compile the .wxs template into a .wixobj, filling preprocessor vars.
+          # Generate the WiX source inline so the build never depends on a
+          # separately committed file being present in the checkout.
+          # Mirrors the source repo's packaging: the GUI app + the CLI, a Start Menu
+          # shortcut, and a per-machine install under Program Files\<AppName>.
+          $wxs = "$env:RUNNER_TEMP/installer.wxs"
+          $lines = @(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">'
+            '  <Product'
+            '      Id="*"'
+            '      Name="$(var.ProductName)"'
+            '      Language="1033"'
+            '      Version="$(var.ProductVersion)"'
+            '      Manufacturer="$(var.Manufacturer)"'
+            '      UpgradeCode="$(var.UpgradeCode)">'
+            '    <Package InstallerVersion="500" Compressed="yes" Platform="x64" />'
+            '    <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" />'
+            '    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of $(var.ProductName) is already installed." />'
+            '    <Directory Id="TARGETDIR" Name="SourceDir">'
+            '      <Directory Id="ProgramFiles64Folder">'
+            '        <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)" />'
+            '      </Directory>'
+            '      <Directory Id="ProgramMenuFolder">'
+            '        <Directory Id="AppMenuDir" Name="$(var.ProductName)" />'
+            '      </Directory>'
+            '    </Directory>'
+            '    <Feature Id="DefaultFeature" Title="$(var.ProductName)" Level="1">'
+            '      <ComponentRef Id="MainExecutable" />'
+            '      <ComponentRef Id="CliExecutable" />'
+            '      <ComponentRef Id="StartMenuShortcut" />'
+            '    </Feature>'
+            '    <Component Id="MainExecutable" Guid="*" Directory="INSTALLFOLDER">'
+            '      <File Id="ExeFile" Source="$(var.SourceDir)\$(var.ExeName)" KeyPath="yes" />'
+            '    </Component>'
+            '    <Component Id="CliExecutable" Guid="*" Directory="INSTALLFOLDER">'
+            '      <File Id="CliFile" Source="$(var.SourceDir)\$(var.CliExeName)" KeyPath="yes" />'
+            '    </Component>'
+            '    <Component Id="StartMenuShortcut" Guid="*" Directory="AppMenuDir">'
+            '      <Shortcut Id="StartMenuShortcut" Name="$(var.ProductName)" Target="[INSTALLFOLDER]$(var.ExeName)" WorkingDirectory="INSTALLFOLDER" />'
+            '      <RegistryValue Root="HKCU" Key="Software\$(var.Manufacturer)\$(var.ProductName)" Name="installed" Type="string" Value="1" KeyPath="yes" />'
+            '    </Component>'
+            '  </Product>'
+            '</Wix>'
+          )
+          $lines -join "`n" | Set-Content -Path $wxs -Encoding UTF8
+          # Compile the generated .wxs into a .wixobj, filling preprocessor vars.
           candle.exe -nologo `
             -dProductName="$env:APP_NAME" `
             -dProductVersion="$ver" `
             -dManufacturer="storytold" `
             -dExeName="$env:EXE_NAME" `
+            -dCliExeName="$env:CLI_EXE_NAME" `
             -dSourceDir="$releaseDir" `
             -dUpgradeCode="$env:UPGRADE_GUID" `
             -out "$env:RUNNER_TEMP/$repo.wixobj" `
-            installer/installer.wxs
+            $wxs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # Link into a single embedded-cabinet MSI (-sval skips ICE validation).
           light.exe -nologo -sval `
@@ -226,10 +276,6 @@ jobs:
     if: ${{ inputs.build_cadcraft }}
     runs-on: windows-latest
     steps:
-      - name: Checkout workflow repo (provides installer/ template)
-        uses: actions/checkout@v4
-        # Gives the job access to installer/installer.wxs for MSI builds.
-
       - name: Checkout storytold/cadcraft
         uses: actions/checkout@v4
         with:
@@ -252,18 +298,25 @@ jobs:
           key: cadcraft-windows-x64
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release binary (cargo build --release -p cadcraft)
+      - name: Build release binaries (cargo build --release -p cadcraft -p cadcraft-cli)
         working-directory: cadcraft
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cargo build --release --locked -p cadcraft *>&1 |
+          # Match the source repo's packaging: build the GUI app AND the CLI, with the
+          # static CRT so the MSI/portable build needs no Visual C++ redistributable.
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
+          cargo build --release --locked -p cadcraft -p cadcraft-cli *>&1 |
             Tee-Object -FilePath build.log
           $code = $LASTEXITCODE
           Write-Host "cargo build exit code: $code"
           if ($code -ne 0) { exit $code }
           if (-not (Test-Path 'target/release/cadcraft.exe')) {
             Write-Error 'cadcraft.exe not found under target/release/'
+            exit 1
+          }
+          if (-not (Test-Path 'target/release/cadcraft-cli.exe')) {
+            Write-Error 'cadcraft-cli.exe not found under target/release/'
             exit 1
           }
 
@@ -300,6 +353,7 @@ jobs:
         env:
           APP_NAME: CADCraft
           EXE_NAME: cadcraft.exe
+          CLI_EXE_NAME: cadcraft-cli.exe
           PKG_NAME: cadcraft
           UPGRADE_GUID: "{B2C3D4E5-2222-3333-4444-555566667777}"
         run: |
@@ -314,17 +368,64 @@ jobs:
           $parts = ($ver.Split('.') | Select-Object -First 3)
           while ($parts.Count -lt 3) { $parts += '0' }
           $ver = $parts -join '.'
-          $msi = "artifacts/$repo/$env:APP_NAME-$ver-x86_64.msi"
+          # Match the source repo's MSI naming: <pkg>-<version>-windows-x64.msi
+          $msi = "artifacts/$repo/$env:PKG_NAME-$ver-windows-x64.msi"
           New-Item -ItemType Directory -Force -Path "artifacts/$repo" | Out-Null
+          # Generate the WiX source inline so the build never depends on a
+          # separately committed file being present in the checkout.
+          # Mirrors the source repo's packaging: the GUI app + the CLI, a Start Menu
+          # shortcut, and a per-machine install under Program Files\<AppName>.
+          $wxs = "$env:RUNNER_TEMP/installer.wxs"
+          $lines = @(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">'
+            '  <Product'
+            '      Id="*"'
+            '      Name="$(var.ProductName)"'
+            '      Language="1033"'
+            '      Version="$(var.ProductVersion)"'
+            '      Manufacturer="$(var.Manufacturer)"'
+            '      UpgradeCode="$(var.UpgradeCode)">'
+            '    <Package InstallerVersion="500" Compressed="yes" Platform="x64" />'
+            '    <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" />'
+            '    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of $(var.ProductName) is already installed." />'
+            '    <Directory Id="TARGETDIR" Name="SourceDir">'
+            '      <Directory Id="ProgramFiles64Folder">'
+            '        <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)" />'
+            '      </Directory>'
+            '      <Directory Id="ProgramMenuFolder">'
+            '        <Directory Id="AppMenuDir" Name="$(var.ProductName)" />'
+            '      </Directory>'
+            '    </Directory>'
+            '    <Feature Id="DefaultFeature" Title="$(var.ProductName)" Level="1">'
+            '      <ComponentRef Id="MainExecutable" />'
+            '      <ComponentRef Id="CliExecutable" />'
+            '      <ComponentRef Id="StartMenuShortcut" />'
+            '    </Feature>'
+            '    <Component Id="MainExecutable" Guid="*" Directory="INSTALLFOLDER">'
+            '      <File Id="ExeFile" Source="$(var.SourceDir)\$(var.ExeName)" KeyPath="yes" />'
+            '    </Component>'
+            '    <Component Id="CliExecutable" Guid="*" Directory="INSTALLFOLDER">'
+            '      <File Id="CliFile" Source="$(var.SourceDir)\$(var.CliExeName)" KeyPath="yes" />'
+            '    </Component>'
+            '    <Component Id="StartMenuShortcut" Guid="*" Directory="AppMenuDir">'
+            '      <Shortcut Id="StartMenuShortcut" Name="$(var.ProductName)" Target="[INSTALLFOLDER]$(var.ExeName)" WorkingDirectory="INSTALLFOLDER" />'
+            '      <RegistryValue Root="HKCU" Key="Software\$(var.Manufacturer)\$(var.ProductName)" Name="installed" Type="string" Value="1" KeyPath="yes" />'
+            '    </Component>'
+            '  </Product>'
+            '</Wix>'
+          )
+          $lines -join "`n" | Set-Content -Path $wxs -Encoding UTF8
           candle.exe -nologo `
             -dProductName="$env:APP_NAME" `
             -dProductVersion="$ver" `
             -dManufacturer="storytold" `
             -dExeName="$env:EXE_NAME" `
+            -dCliExeName="$env:CLI_EXE_NAME" `
             -dSourceDir="$releaseDir" `
             -dUpgradeCode="$env:UPGRADE_GUID" `
             -out "$env:RUNNER_TEMP/$repo.wixobj" `
-            installer/installer.wxs
+            $wxs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           light.exe -nologo -sval `
             "$env:RUNNER_TEMP/$repo.wixobj" `
@@ -383,6 +484,6 @@ jobs:
           }
           if ('${{ inputs.build_msi }}' -eq 'true') {
             $lines += ''
-            $lines += 'MSI installers (when built) are included in the per-repo artifacts (e.g. PhotoCraft-0.8.2-x86_64.msi).'
+            $lines += 'MSI installers (when built) are included in the per-repo artifacts (e.g. photocraft-0.8.2-windows-x64.msi).'
           }
           $lines -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
