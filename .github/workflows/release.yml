@@ -12,6 +12,11 @@
 # required is Rust (MSVC host triple on windows-latest). Trunk + wasm32 target
 # are only needed for the optional web builds and are NOT part of this flow.
 #
+# MSI packaging: after the release build, each job compiles an MSI with the
+# WiX Toolset v3 (downloaded from the official release, pinned to 3.14.1). A
+# generic installer/installer.wxs template in THIS repo is filled via candle
+# preprocessor variables. Output: artifacts/<repo>/<App>-<ver>-x86_64.msi
+#
 # Trigger: manual only (workflow_dispatch).
 #   - build_photocraft / build_cadcraft : build each repo independently
 #   - clean_cache                       : skip restoring AND saving the Cargo cache
@@ -40,6 +45,10 @@ on:
         description: "Do not restore or save the Cargo build cache"
         type: boolean
         default: false
+      build_msi:
+        description: "Package a Windows MSI installer with the WiX Toolset"
+        type: boolean
+        default: true
       rust_toolchain:
         description: "Rust toolchain version (cadcraft desktop needs >= 1.95)"
         type: string
@@ -69,6 +78,11 @@ jobs:
     if: ${{ inputs.build_photocraft }}
     runs-on: windows-latest
     steps:
+      - name: Checkout workflow repo (provides installer/ template)
+        uses: actions/checkout@v4
+        # No repository specified -> checks out THIS repo at the triggering ref,
+        # giving the job access to installer/installer.wxs used for MSI builds.
+
       - name: Checkout storytold/photocraft
         uses: actions/checkout@v4
         with:
@@ -125,6 +139,64 @@ jobs:
           }
           if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
 
+      - name: Install WiX Toolset v3 (pinned 3.14.1)
+        if: ${{ inputs.build_msi }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "$env:RUNNER_TEMP\wix.zip"
+          $wixDir = "$env:RUNNER_TEMP\wix"
+          # Official WiX v3 binaries; redirect is followed automatically.
+          Invoke-WebRequest `
+            -Uri "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip" `
+            -OutFile $zip
+          New-Item -ItemType Directory -Force -Path $wixDir | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $wixDir -Force
+          # Make candle.exe / light.exe available to subsequent steps.
+          Add-Content -Path $env:GITHUB_PATH -Value $wixDir
+
+      - name: Build MSI installer (WiX)
+        if: ${{ inputs.build_msi }}
+        shell: pwsh
+        env:
+          APP_NAME: PhotoCraft
+          EXE_NAME: photocraft.exe
+          PKG_NAME: photocraft
+          UPGRADE_GUID: "{A1B2C3D4-1111-2222-3333-444455556666}"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:PKG_NAME
+          $releaseDir = Resolve-Path "$repo/target/release"
+          # Read the package version from cargo metadata (no build needed).
+          $meta = cargo metadata --manifest-path "$repo/Cargo.toml" --no-deps --format-version 1 |
+                  ConvertFrom-Json
+          $ver = ($meta.packages | Where-Object { $_.name -eq $env:PKG_NAME }).version
+          if (-not $ver) { $ver = '0.0.0' }
+          # MSI ProductVersion must be major.minor.build (<= 3 numeric parts).
+          $ver = ($ver -split '[-+]')[0]
+          $parts = ($ver.Split('.') | Select-Object -First 3)
+          while ($parts.Count -lt 3) { $parts += '0' }
+          $ver = $parts -join '.'
+          $msi = "artifacts/$repo/$env:APP_NAME-$ver-x86_64.msi"
+          New-Item -ItemType Directory -Force -Path "artifacts/$repo" | Out-Null
+          # Compile the .wxs template into a .wixobj, filling preprocessor vars.
+          candle.exe -nologo `
+            -dProductName="$env:APP_NAME" `
+            -dProductVersion="$ver" `
+            -dManufacturer="storytold" `
+            -dExeName="$env:EXE_NAME" `
+            -dSourceDir="$releaseDir" `
+            -dUpgradeCode="$env:UPGRADE_GUID" `
+            -out "$env:RUNNER_TEMP/$repo.wixobj" `
+            installer/installer.wxs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Link into a single embedded-cabinet MSI (-sval skips ICE validation).
+          light.exe -nologo -sval `
+            "$env:RUNNER_TEMP/$repo.wixobj" `
+            -out $msi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Produced MSI: $msi"
+
       - name: Upload artifact (photocraft-windows-x64)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -154,6 +226,10 @@ jobs:
     if: ${{ inputs.build_cadcraft }}
     runs-on: windows-latest
     steps:
+      - name: Checkout workflow repo (provides installer/ template)
+        uses: actions/checkout@v4
+        # Gives the job access to installer/installer.wxs for MSI builds.
+
       - name: Checkout storytold/cadcraft
         uses: actions/checkout@v4
         with:
@@ -204,6 +280,58 @@ jobs:
           }
           if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
 
+      - name: Install WiX Toolset v3 (pinned 3.14.1)
+        if: ${{ inputs.build_msi }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "$env:RUNNER_TEMP\wix.zip"
+          $wixDir = "$env:RUNNER_TEMP\wix"
+          Invoke-WebRequest `
+            -Uri "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip" `
+            -OutFile $zip
+          New-Item -ItemType Directory -Force -Path $wixDir | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $wixDir -Force
+          Add-Content -Path $env:GITHUB_PATH -Value $wixDir
+
+      - name: Build MSI installer (WiX)
+        if: ${{ inputs.build_msi }}
+        shell: pwsh
+        env:
+          APP_NAME: CADCraft
+          EXE_NAME: cadcraft.exe
+          PKG_NAME: cadcraft
+          UPGRADE_GUID: "{B2C3D4E5-2222-3333-4444-555566667777}"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:PKG_NAME
+          $releaseDir = Resolve-Path "$repo/target/release"
+          $meta = cargo metadata --manifest-path "$repo/Cargo.toml" --no-deps --format-version 1 |
+                  ConvertFrom-Json
+          $ver = ($meta.packages | Where-Object { $_.name -eq $env:PKG_NAME }).version
+          if (-not $ver) { $ver = '0.0.0' }
+          $ver = ($ver -split '[-+]')[0]
+          $parts = ($ver.Split('.') | Select-Object -First 3)
+          while ($parts.Count -lt 3) { $parts += '0' }
+          $ver = $parts -join '.'
+          $msi = "artifacts/$repo/$env:APP_NAME-$ver-x86_64.msi"
+          New-Item -ItemType Directory -Force -Path "artifacts/$repo" | Out-Null
+          candle.exe -nologo `
+            -dProductName="$env:APP_NAME" `
+            -dProductVersion="$ver" `
+            -dManufacturer="storytold" `
+            -dExeName="$env:EXE_NAME" `
+            -dSourceDir="$releaseDir" `
+            -dUpgradeCode="$env:UPGRADE_GUID" `
+            -out "$env:RUNNER_TEMP/$repo.wixobj" `
+            installer/installer.wxs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          light.exe -nologo -sval `
+            "$env:RUNNER_TEMP/$repo.wixobj" `
+            -out $msi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Produced MSI: $msi"
+
       - name: Upload artifact (cadcraft-windows-x64)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -252,5 +380,9 @@ jobs:
             $lines += 'Both builds were skipped via workflow_dispatch inputs.'
           } else {
             $lines += 'All requested builds succeeded. Download artifacts from the run page.'
+          }
+          if ('${{ inputs.build_msi }}' -eq 'true') {
+            $lines += ''
+            $lines += 'MSI installers (when built) are included in the per-repo artifacts (e.g. PhotoCraft-0.8.2-x86_64.msi).'
           }
           $lines -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
