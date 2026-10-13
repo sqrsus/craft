@@ -1,4 +1,4 @@
-name: vera20 Release
+name: vera20k Release
 
 # Downloadable builds of the game for players who do not compile it.
 #
@@ -36,6 +36,13 @@ jobs:
           - os: windows-latest
             target: windows-x64
             program: vera20k.exe
+    # Pin every step to the checkout root. Without this, a `working-directory`
+    # override (e.g. `defaults.run.working-directory: <repo>`) would run cargo
+    # one directory too deep and fail with "cargo manifest path ... does not
+    # exist" (the doubled `.../<repo>/<repo>` path seen in CI logs).
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
     steps:
       # The program embeds text files (shaders, the capture contract); keep
       # their LF bytes instead of the Windows runner's CRLF checkout.
@@ -103,6 +110,9 @@ jobs:
       # --repo <owner>/<repo>` proves an archive came from this workflow.
       id-token: write
       attestations: write
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
     steps:
       - uses: actions/download-artifact@v8
         with:
