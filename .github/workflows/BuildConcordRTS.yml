@@ -1,299 +1,156 @@
-# ============================================================================
-# ConcordRTS 手动编译工作流（Manual Build Workflow）
-# ----------------------------------------------------------------------------
-# 部署位置（重要）：本工作流【并不放在 ConcordRTS 源码仓库内】，而是存放在一个
-#   【独立的构建仓库】（build repo）中。它通过 actions/checkout 显式拉取源仓库
-#   AdrianLuo-X/ConcordRTS 的源码到运行器工作区，再在本（构建）仓库内完成编译与
-#   产物上传。这样 ConcordRTS 源码仓库保持纯净，构建/CI 与发布逻辑集中在独立仓库。
+# =============================================================================
+# 独立仓库中的手动编译工作流（workflow_dispatch）
+# 目标项目：https://github.com/AdrianLuo-X/ConcordRTS
 #
-# 触发方式：在【构建仓库】的 Actions 页选择本工作流 → "Run workflow" → 手动触发
-#          （on: workflow_dispatch，纯手动，无自动触发）。
-#
-# 源仓库（被构建对象）：https://github.com/AdrianLuo-X/ConcordRTS
-# 构建仓库（本文件所在）：即提交本工作流的任意独立仓库
-# 切换源仓库：改下方 env.SOURCE_REPO / env.SOURCE_REF 即可（也可用 source_ref 参数临时覆盖）
-#
-# 设计依据（来自对仓库的静态分析）：
-#   - 构建系统：CMake 3.20+，Visual Studio 生成器（VS2022 / 18 2026），x64 平台。
-#   - 第三方依赖：无（仓库根目录无 vcpkg.json / conanfile / package.json /
-#     requirements.txt / .gitmodules）。所有链接库均为 Windows 系统库：
-#     winmm, ws2_32, bcrypt, secur32, crypt32, comdlg32, xaudio2, ole32, xapobase。
-#   - 运行时依赖：Visual Studio 2022+（含“使用 C++ 的桌面开发”、Windows SDK、
-#     x64 与 Win32 工具链）与 CMake 3.20+。这些在本工作流的 windows-2022
-#     运行器镜像中均已内置，无需额外安装步骤。
-#   - 仅编译游戏核心不需要官方游戏素材，也不需要 Python。
-#   - 视频桥接工具 BinkFrameExtractor 通过 ExternalProject 以 Win32 子构建方式
-#     编译，并作为 concord_runtime 的依赖自动被拉起、暂存到 build/<cfg>/。
-# ============================================================================
-
-name: Build ConcordRTS (Manual)
-
-# 源仓库引用：本工作流位于独立构建仓库，实际编译对象为下面的源仓库。
-env:
-  SOURCE_REPO: AdrianLuo-X/ConcordRTS
-  SOURCE_REF: main
+# 说明：
+#   1. 本文件放在"独立仓库"（非源仓库）的 .github/workflows/ 目录下即可使用，
+#      源仓库 ConcordRTS 无需任何改动。
+#   2. 工作流通过 actions/checkout 的 repository 参数拉取源仓库源码；
+#      源仓库为 public，默认 GITHUB_TOKEN 即可读取。
+#   3. 编译完全复用项目自带构建入口 tools/Build-Game.ps1（与 README 中
+#      的 编译.cmd 等价），保证 CI 与本地手动编译行为一致：
+#      CMake 配置 -> 构建 Release 目标 concord_runtime -> 连带构建 Win32
+#      视频桥接 BinkFrameExtractor -> 收集 VC++ 运行库 DLL -> 汇总到 bin/。
+#   4. GitHub windows-latest 运行器已预装 Visual Studio 2022（含"使用 C++
+#      的桌面开发"负载、x64/Win32 工具链、Windows SDK）与 CMake，
+#      因此无需额外安装步骤；第 2、3 步只做显式校验，缺件时尽早失败。
+# =============================================================================
+name: Build ConcordRTS (manual)
 
 on:
   workflow_dispatch:
     inputs:
-      build_config:
-        description: 'CMake 构建配置（Debug 下 concord_runtime 仍以 /O2 优化编译，仅保留调试符号）'
-        required: true
-        default: 'Release'
-        type: choice
-        options:
-          - Release
-          - Debug
-      build_rules_dump:
-        description: '额外构建离线分析/规则导出工具 concord_rules_dump（默认只构建游戏核心）'
-        required: true
-        default: false
-        type: boolean
-      upload_artifacts:
-        description: '将 bin/ 下的构建产物上传为工作流 Artifact，供下载'
-        required: true
-        default: true
-        type: boolean
-      artifact_retention_days:
-        description: 'Artifact 保留天数（1-90）'
-        required: false
-        default: '30'
       source_ref:
-        description: '要构建的源仓库分支/标签/commit（留空则用 env.SOURCE_REF 默认值 main）'
-        required: false
-        default: ''
+        description: "要编译的 ConcordRTS 分支 / 标签 / 提交 SHA（默认 main）"
+        required: true
+        default: "main"
 
-# 并发保护：按“源仓库 + 目标 ref”分组，避免不同来源/版本的手动构建互相覆盖 build/ 目录
+permissions:
+  contents: read
+
+# 串行构建较久，避免同一分支并发触发多个重型任务互相抢占运行器
 concurrency:
-  group: concordrts-manual-build-${{ env.SOURCE_REPO }}-${{ github.event.inputs.source_ref || env.SOURCE_REF }}
+  group: build-concordrts-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build on Windows (MSVC x64)
-    runs-on: windows-2022
-
+  build-windows-x64:
+    name: Windows x64 / Release
+    runs-on: windows-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
     steps:
-      # ----------------------------------------------------------------------
-      # 0. 拉取源仓库代码（关键：指向独立源仓库，而非本工作流所在仓库）
-      #    actions/checkout 默认只检出“工作流所在仓库”；本工作流位于构建仓库，
-      #    因此必须显式指定 repository/ref 拉取 ConcordRTS 源码到工作区根目录。
-      # ----------------------------------------------------------------------
-      - name: Checkout ConcordRTS source (from separate source repo)
+      # ---------- 1. 源码获取 ----------
+      - name: "1. 检出 ConcordRTS 源码（环境准备：操作系统 = windows-latest / Windows x64）"
         uses: actions/checkout@v4
         with:
-          # 显式拉取【源仓库】代码，而非本工作流所在的构建仓库。
-          # 这样无论本工作流提交到哪个独立仓库，都能正确获取 ConcordRTS 源码。
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ github.event.inputs.source_ref || env.SOURCE_REF }}
-          fetch-depth: 1
-          # 若源仓库为私有，请在本构建仓库的 Secrets 中配置具有 repo 读取权限的
-          # PAT（名称 SOURCE_REPO_PAT），并取消下一行注释：
-          # token: ${{ secrets.SOURCE_REPO_PAT }}
+          repository: AdrianLuo-X/ConcordRTS
+          ref: ${{ inputs.source_ref }}
+          path: ConcordRTS
 
-      # ----------------------------------------------------------------------
-      # 1. 环境准备（Environment Preparation）
-      #    windows-2022 镜像已预装：
-      #      - Visual Studio 2022 Enterprise（含 Desktop C++、Windows SDK、x64+Win32 工具链）
-      #      - CMake 3.20+（位于系统 PATH）
-      #    本步骤仅做工具链自检，不安装系统级软件。
-      # ----------------------------------------------------------------------
-      - name: Verify toolchain (Visual Studio 2022 + CMake + Win32 toolset)
-        shell: pwsh
+      # ---------- 2. 工具链校验（环境准备：Visual Studio 2022 + CMake） ----------
+      - name: "2. 校验工具链（Visual Studio 2022 C++ / CMake / Windows SDK）"
+        working-directory: ConcordRTS
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          # CMake 必须存在
-          $cmake = Get-Command cmake.exe -ErrorAction SilentlyContinue
-          if (-not $cmake) { throw 'CMake not found in PATH.' }
-          & cmake --version | Select-Object -First 1
-
-          # Visual Studio C++ 工具链（含 Win32 子工具集）必须存在
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
           if (-not (Test-Path -LiteralPath $vswhere)) {
-            throw 'vswhere.exe not found; Visual Studio 2022 is required.'
+            throw 'vswhere.exe 不存在：运行器未安装 Visual Studio。'
           }
-          $vsHome = & $vswhere -latest -products * `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath | Select-Object -First 1
-          if (-not $vsHome) { throw 'No Visual Studio C++ toolchain was found.' }
-
-          $vsVer = & $vswhere -latest -products * `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationVersion | Select-Object -First 1
-          Write-Host "Detected Visual Studio installation: $vsHome (version $vsVer)"
-
-          # 确认 Win32 (x86) 工具链可用（BinkFrameExtractor 的 Win32 子构建需要）
-          $win32Toolset = Join-Path $vsHome 'VC\Tools\MSVC'
-          if (-not (Test-Path -LiteralPath $win32Toolset)) {
-            throw 'MSVC toolset directory not found; Win32 build will fail.'
+          $vsHome = & $vswhere -latest -products '*' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vsVersion = & $vswhere -latest -products '*' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
+          Write-Host "Visual Studio : $vsVersion"
+          Write-Host "Installation : $vsHome"
+          if (-not $vsHome) {
+            throw '未找到包含 VC.Tools.x86.x64（C++ x64/Win32 工具链）的 Visual Studio 安装。'
           }
-          Write-Host "MSVC toolset directory: $win32Toolset"
+          if ([version]$vsVersion -lt [version]'17.0') {
+            throw "需要 Visual Studio 2022 (17.x) 或更高版本，当前为 $vsVersion。"
+          }
+          # 项目脚本优先使用 VS 自带 CMake，缺失时回退 PATH 中的 cmake
+          $vsCmake = Join-Path $vsHome 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+          $cmakeExe = $null
+          if (Test-Path -LiteralPath $vsCmake) { $cmakeExe = $vsCmake }
+          else { $cmakeExe = (Get-Command cmake.exe -ErrorAction SilentlyContinue).Source }
+          if (-not $cmakeExe) {
+            throw '未找到 CMake（VS 自带与 PATH 均无），请启用 VS 的 C++ CMake 工具组件。'
+          }
+          Write-Host "CMake        : $cmakeExe"
+          & $cmakeExe --version | Select-Object -First 1
+          Write-Host '工具链校验通过。'
 
-      # ----------------------------------------------------------------------
-      # 2. 依赖安装（Dependency Installation）
-      #    结论：本项目无第三方/外部依赖，无需 vcpkg / conan / pip / npm 安装。
-      #    本步骤显式核验这一点，并确认 Windows SDK（提供 xaudio2 / xapobase）
-      #    存在，作为“依赖就绪”检查。
-      # ----------------------------------------------------------------------
-      - name: Check dependency manifests and Windows SDK
-        shell: pwsh
+      # ---------- 3. 依赖安装 ----------
+      - name: "3. 依赖安装（本项目无第三方依赖，仅校验）"
+        working-directory: ConcordRTS
         run: |
-          $ErrorActionPreference = 'Stop'
-          $root = "${{ github.workspace }}"
-
-          $thirdParty = @('vcpkg.json','vcpkg-configuration.json','conanfile.txt',
-                          'conanfile.py','package.json','requirements.txt','.gitmodules')
-          $found = @()
-          foreach ($m in $thirdParty) {
-            if (Test-Path -LiteralPath (Join-Path $root $m)) { $found += $m }
-          }
-          if ($found.Count -gt 0) {
-            throw "Unexpected third-party dependency manifests found: $($found -join ', ')"
-          }
-          Write-Host 'No third-party dependency manager required (no vcpkg/conan/npm/pip).'
-          Write-Host 'All required libraries are Windows system libs / Windows SDK imports.'
-
-          # 校验 Windows SDK 是否提供 xaudio2 / xapobase（concord_runtime 链接项）
-          $sdkLib = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Lib'
-          if (-not (Test-Path -LiteralPath $sdkLib)) {
-            throw 'Windows SDK Lib directory not found; xaudio2/xapobase will fail to link.'
-          }
-          $hasXaudio = Get-ChildItem -LiteralPath $sdkLib -Recurse -Filter 'xaudio2.lib' `
-            -ErrorAction SilentlyContinue | Select-Object -First 1
-          $hasXapo = Get-ChildItem -LiteralPath $sdkLib -Recurse -Filter 'xapobase.lib' `
-            -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $hasXaudio) { throw 'xaudio2.lib not found in Windows SDK.' }
-          if (-not $hasXapo)   { throw 'xapobase.lib not found in Windows SDK.' }
-          Write-Host "Windows SDK libs present: $(Split-Path $hasXaudio.FullName -Parent)"
-
-      # ----------------------------------------------------------------------
-      # 3. 配置（CMake Configure）
-      #    生成 Visual Studio 2022 工程（x64），并将 CMAKE_GENERATOR_INSTANCE
-      #    指向检测到的 VS 安装，确保 Win32 子构建也能解析到正确的工具链。
-      #    构建目录（build/）与 README / .gitignore 保持一致。
-      # ----------------------------------------------------------------------
-      - name: Configure (CMake, VS2022 x64)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $root = "${{ github.workspace }}"
-          $vsHome = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
-            -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath | Select-Object -First 1
-
-          & cmake.exe -S $root -B (Join-Path $root 'build') `
-            -G "Visual Studio 17 2022" -A x64 `
-            "-DCMAKE_GENERATOR_INSTANCE=$vsHome"
-          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
-
-      # ----------------------------------------------------------------------
-      # 4. 编译 / 构建（Build）
-      #    构建 concord_runtime（主游戏可执行文件，C++20）。
-      #    该目标通过 ExternalProject 依赖自动拉起 Win32 BinkFrameExtractor
-      #    子构建，并将其暂存到 build/<cfg>/BinkFrameExtractor.exe。
-      #    使用 --parallel 充分利用运行器多核（原 编译.cmd 用 --parallel 1）。
-      # ----------------------------------------------------------------------
-      - name: Build concord_runtime (and Win32 Bink bridge)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $root = "${{ github.workspace }}"
-          $cfg  = "${{ github.event.inputs.build_config }}"
-          & cmake.exe --build (Join-Path $root 'build') --config $cfg `
-            --target concord_runtime --parallel
-          if ($LASTEXITCODE -ne 0) { throw 'Game compilation failed.' }
-
-      - name: Optionally build concord_rules_dump
-        if: ${{ github.event.inputs.build_rules_dump == 'true' }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $root = "${{ github.workspace }}"
-          $cfg  = "${{ github.event.inputs.build_config }}"
-          & cmake.exe --build (Join-Path $root 'build') --config $cfg `
-            --target concord_rules_dump --parallel
-          if ($LASTEXITCODE -ne 0) { throw 'concord_rules_dump build failed.' }
-
-      # ----------------------------------------------------------------------
-      # 5. 构建产物收集（Stage Artifacts to bin/）
-      #    与原 tools/Build-Game.ps1 一致：将 exe 与 MSVC 动态 CRT 复制到 bin/。
-      #    concord_runtime 使用 MultiThreadedDLL（动态 CRT），因此需要：
-      #      msvcp140.dll, msvcp140_atomic_wait.dll, vcruntime140.dll, vcruntime140_1.dll
-      #    BinkFrameExtractor 使用静态 CRT（MultiThreaded），无需附带 DLL。
-      # ----------------------------------------------------------------------
-      - name: Stage runtime artifacts to bin/
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $root = "${{ github.workspace }}"
-          $cfg  = "${{ github.event.inputs.build_config }}"
-          $buildRoot = Join-Path $root 'build'
-          $binRoot   = Join-Path $root 'bin'
-          New-Item -ItemType Directory -Path $binRoot -Force | Out-Null
-
-          # 主程序与视频桥接
-          $runtimeExe = Join-Path $buildRoot $cfg 'concord_runtime.exe'
-          if (-not (Test-Path -LiteralPath $runtimeExe)) { throw "Missing build output: $runtimeExe" }
-          Copy-Item -LiteralPath $runtimeExe -Destination (Join-Path $binRoot 'concord_runtime.exe') -Force
-
-          $binkExe = Join-Path $buildRoot $cfg 'BinkFrameExtractor.exe'
-          if (Test-Path -LiteralPath $binkExe) {
-            Copy-Item -LiteralPath $binkExe -Destination (Join-Path $binRoot 'BinkFrameExtractor.exe') -Force
-            Write-Host 'Staged BinkFrameExtractor.exe (Win32 video bridge).'
-          } else {
-            Write-Warning 'BinkFrameExtractor.exe not found in build output; skipping.'
-          }
-
-          # 复制 MSVC 动态 CRT（x64），使 bin/ 可直接分发运行
-          $vsHome = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
-            -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath | Select-Object -First 1
-          $redistRoot = Join-Path $vsHome 'VC\Redist\MSVC'
-          $crtVersion = Get-ChildItem -LiteralPath $redistRoot -Directory `
-            | Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } `
-            | Sort-Object { [version]$_.Name } -Descending `
-            | Select-Object -First 1
-          if (-not $crtVersion) { throw 'Visual Studio x64 CRT redistributable files were not found.' }
-          $crtDir = Get-ChildItem -LiteralPath (Join-Path $crtVersion.FullName 'x64') -Directory `
-            -Filter 'Microsoft.VC*.CRT' | Select-Object -First 1
-          if (-not $crtDir) { throw 'Microsoft.VC*.CRT directory not found under redist x64.' }
-
-          $dlls = @('msvcp140.dll','msvcp140_atomic_wait.dll','vcruntime140.dll','vcruntime140_1.dll')
-          foreach ($dll in $dlls) {
-            $src = Join-Path $crtDir.FullName $dll
-            if (Test-Path -LiteralPath $src) {
-              Copy-Item -LiteralPath $src -Destination (Join-Path $binRoot $dll) -Force
-              Write-Host "Copied $dll"
-            } else {
-              Write-Warning "Required runtime file not found: $dll"
+          git --version
+          # 上游根 CMakeLists.txt 仅 include(cmake/*.cmake)，目标只链接 Windows 系统
+          # 导入库（winmm / ws2_32 / bcrypt / secur32 / crypt32 / comdlg32 /
+          # xaudio2 / ole32 / xapobase），无 vcpkg / FetchContent / Python 依赖。
+          # 此处显式校验：一旦上游未来引入外部依赖，本步骤会立即失败提示补充安装。
+          foreach ($manifest in @('vcpkg.json', 'conanfile.txt', 'conanfile.py', 'requirements.txt')) {
+            if (Test-Path -LiteralPath $manifest) {
+              throw "检测到依赖清单 $manifest，需要在本工作流中补充依赖安装步骤。"
             }
           }
+          $cmakeFiles = Get-ChildItem -LiteralPath . -Recurse -File -Include '*.txt', '*.cmake' |
+            Where-Object { $_.FullName -notmatch '\\build\\' }
+          $externalRefs = $cmakeFiles |
+            ForEach-Object { Select-String -LiteralPath $_.FullName -Pattern 'find_package\s*\(|FetchContent|vcpkg_from_github' -ErrorAction SilentlyContinue }
+          if ($externalRefs) {
+            $detail = ($externalRefs | ForEach-Object { "$($_.Path): $($_.Line.Trim())" }) -join "`n"
+            throw "CMake 配置中出现外部依赖引用，需要补充安装步骤：`n$detail"
+          }
+          Write-Host '已确认：编译仅依赖 Visual Studio 2022 C++ 工具链 + Windows SDK（运行器预装），无第三方包需要安装。'
 
-          Write-Host "=== bin/ contents ==="
-          Get-ChildItem -LiteralPath $binRoot | Select-Object Name, Length | Format-Table -AutoSize
+      # ---------- 4. 编译 / 构建 ----------
+      - name: "4. 编译 ConcordRTS（复用项目自带 tools/Build-Game.ps1）"
+        working-directory: ConcordRTS
+        run: |
+          # 与仓库根目录 编译.cmd 等价的调用方式；脚本内部完成：
+          #   vswhere 定位 VS -> 选择 "Visual Studio 17 2022" 生成器（VS18+ 则为 18 2026）
+          #   -> cmake -A x64 配置 -> cmake --build --config Release --target concord_runtime
+          #   -> 联动 Win32 子构建 BinkFrameExtractor 并暂存到 Release 目录
+          #   -> 复制 VC++ 可再发行组件 DLL 到 bin/
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./tools/Build-Game.ps1
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build-Game.ps1 失败，退出码 $LASTEXITCODE"
+          }
+          Write-Host 'Build-Game.ps1 执行成功。'
 
-      # ----------------------------------------------------------------------
-      # 6. 上传构建产物（Upload Artifacts）
-      #    输出路径（供用户在 Actions 页下载 zip）：
-      #      Artifact name: concordrts-<cfg>
-      #      Artifact 内容: bin/ 目录（concord_runtime.exe, BinkFrameExtractor.exe, CRT DLLs）
-      #    同时保留 build/ 供调试（不打包上传，避免体积过大）。
-      # ----------------------------------------------------------------------
-      - name: Upload build artifacts
-        if: ${{ github.event.inputs.upload_artifacts == 'true' }}
+      # ---------- 5. 产物核对 ----------
+      - name: "5. 核对构建产物（输出路径 bin/）"
+        working-directory: ConcordRTS
+        run: |
+          $binDir = Join-Path (Get-Location) 'bin'
+          if (-not (Test-Path -LiteralPath $binDir)) {
+            throw "未找到产物目录 $binDir"
+          }
+          Write-Host "产物目录：$binDir"
+          Get-ChildItem -LiteralPath $binDir -File |
+            Sort-Object Name |
+            ForEach-Object { "{0,-28} {1,12:N0} bytes" -f $_.Name, $_.Length }
+          foreach ($required in @('concord_runtime.exe', 'BinkFrameExtractor.exe')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $binDir $required))) {
+              throw "缺少关键产物：$required"
+            }
+          }
+          # VC++ 运行库 DLL（由构建脚本从 VS 可再发行组件目录复制）
+          foreach ($dll in @('msvcp140.dll', 'msvcp140_atomic_wait.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $binDir $dll))) {
+              throw "缺少 VC++ 运行库：$dll"
+            }
+          }
+          Write-Host '产物核对通过。'
+
+      # ---------- 6. 产物上传 ----------
+      - name: "6. 上传构建产物（upload-artifact）"
         uses: actions/upload-artifact@v4
         with:
-          name: concordrts-${{ github.event.inputs.build_config }}
-          path: bin/
+          name: ConcordRTS-windows-x64
+          path: ConcordRTS/bin/
           if-no-files-found: error
-          retention-days: ${{ fromJSON(github.event.inputs.artifact_retention_days) }}
-
-      - name: Summarize build paths
-        shell: pwsh
-        run: |
-          $cfg = "${{ github.event.inputs.build_config }}"
-          Write-Host "Source repo     : ${{ env.SOURCE_REPO }} @ ${{ github.event.inputs.source_ref || env.SOURCE_REF }}"
-          Write-Host "Build directory : build/ (binary tree: build/$cfg/)"
-          Write-Host "Output directory: bin/ (concord_runtime.exe, BinkFrameExtractor.exe, CRT DLLs)"
-          Write-Host "Artifact name   : concordrts-$cfg"
+          retention-days: 14
