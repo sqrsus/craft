@@ -1,0 +1,138 @@
+# =============================================================================
+# 独立仓库中的手动编译工作流（workflow_dispatch）
+# 目标项目：https://github.com/OpenRA/OpenRA（默认分支 bleed）
+#
+# 说明：
+#   1. 本文件放在"独立仓库"（非源仓库）的 .github/workflows/ 目录下即可使用，
+#      源仓库 OpenRA 无需任何改动。
+#   2. 编译方式与官方文档（INSTALL.md）及官方 CI（.github/workflows/ci.yml 的
+#      windows job）保持一致：actions/checkout 拉取源码 ->
+#      actions/setup-dotnet 安装 .NET 10 SDK -> make.ps1 all（内部即
+#      dotnet build -c Release -p:TargetPlatform=win-x64）-> 上传 bin/ 产物。
+#   3. 仅编译 Windows x64：make.ps1 依据 PROCESSOR_ARCHITECTURE 自动选择
+#      win-x64（运行器为 AMD64），ARM64 分支不会触发。
+#   4. 注意 make.ps1 的 All-Command 在 dotnet build 失败时只打印红色提示、
+#      不返回非零退出码，因此第 4 步显式校验关键产物，失败即让任务失败。
+# =============================================================================
+name: Build OpenRA (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "要编译的 OpenRA 分支 / 标签 / 提交 SHA（默认 bleed）"
+        required: true
+        default: "bleed"
+      configuration:
+        description: "构建配置"
+        required: true
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - Debug
+
+permissions:
+  contents: read
+
+# OpenRA 为大型 C# 解决方案，避免同一分支并发触发多个重型任务互相抢占运行器
+concurrency:
+  group: build-openra-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows-x64:
+    name: Windows x64 (.NET 10)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      # 由 workflow_dispatch 输入注入，避免直接插值进脚本
+      CONFIGURATION: ${{ inputs.configuration }}
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      # ---------- 1. 源码获取（环境准备：操作系统 = windows-2022 / x64） ----------
+      - name: "1. 检出 OpenRA 源码"
+        uses: actions/checkout@v7
+        with:
+          repository: OpenRA/OpenRA
+          ref: ${{ inputs.source_ref }}
+          path: OpenRA
+
+      # ---------- 2. 工具链安装（环境准备：.NET 10 SDK） ----------
+      - name: "2. 安装 .NET 10 SDK（工具链）"
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # ---------- 3. 依赖安装 ----------
+      - name: "3. 依赖安装（NuGet 源就绪；原生库随 NuGet 还原）"
+        working-directory: OpenRA
+        run: |
+          dotnet --info
+          # 与官方 CI 一致：确保 nuget.org 源可用（规避 GH 运行器偶发还原失败）
+          $sources = dotnet nuget list source
+          if ($sources -notmatch 'nuget\.org') {
+            dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org
+          }
+          dotnet nuget list source
+          # SDL2 / OpenAL / FreeType / Eluant(Lua) 等原生与托管依赖均以 NuGet 包提供
+          # （OpenRA.Platforms.Default 与 OpenRA.Game 的 PackageReference），
+          # win-x64 下由 dotnet build 隐式还原自动完成，无需安装系统库；
+          # GeoIP 数据库（IP2Location ZIP）由 make.ps1 all 在构建时自动下载。
+
+      # ---------- 4. 编译 / 构建 ----------
+      - name: "4. 编译 OpenRA（make.ps1 all，win-x64）"
+        working-directory: OpenRA
+        run: |
+          if ($env:CONFIGURATION -eq "Debug") {
+            .\make.ps1 all CONFIGURATION=Debug
+          }
+          else {
+            .\make.ps1 all
+          }
+          # make.ps1 的 All-Command 在 dotnet build 失败时不会返回非零退出码，
+          # 因此显式校验关键产物；缺失即视为编译失败。
+          $required = @(
+            'bin\OpenRA.dll',
+            'bin\OpenRA.Utility.exe',
+            'bin\OpenRA.Platforms.Default.dll',
+            'bin\OpenRA.Mods.Common.dll',
+            'bin\OpenRA.Mods.Cnc.dll',
+            'bin\OpenRA.Mods.D2k.dll'
+          )
+          foreach ($f in $required) {
+            if (-not (Test-Path -LiteralPath $f)) {
+              throw "编译失败或产物缺失：$f"
+            }
+          }
+          Write-Host "编译完成（$env:CONFIGURATION / win-x64），关键产物均已生成。"
+
+      # ---------- 5. 产物核对 ----------
+      - name: "5. 核对构建产物（输出路径 bin/）"
+        working-directory: OpenRA
+        run: |
+          Write-Host 'bin\ 目录内容：'
+          Get-ChildItem -LiteralPath bin -File |
+            Sort-Object Name |
+            ForEach-Object { "{0,-40} {1,12:N0} bytes" -f $_.Name, $_.Length }
+          # make.ps1 all 会下载 GeoIP 数据库到仓库根（联机地区显示用）
+          $geoip = 'IP2LOCATION-LITE-DB1.IPV6.BIN.ZIP'
+          if (Test-Path -LiteralPath $geoip) {
+            "{0,-40} {1,12:N0} bytes" -f $geoip, (Get-Item -LiteralPath $geoip).Length
+          }
+          else {
+            Write-Warning "未找到 $geoip（make.ps1 all 本应自动下载，请检查网络）。"
+          }
+
+      # ---------- 6. 产物上传 ----------
+      - name: "6. 上传构建产物（upload-artifact）"
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenRA-windows-x64
+          path: |
+            OpenRA/bin/
+            OpenRA/IP2LOCATION-LITE-DB1.IPV6.BIN.ZIP
+          if-no-files-found: error
+          retention-days: 14
