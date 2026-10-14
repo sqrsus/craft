@@ -89,6 +89,14 @@ jobs:
       - name: Build release binaries
         working-directory: photocraft
         shell: pwsh
+        env:
+          # Mirrors the reference build step. CARGO_HOME is the runner default but
+          # pinned here for parity; CARGO_INCREMENTAL=0 keeps CI builds lean.
+          # CACHE_ON_FAILURE has no standard consumer in this flow (leftover from
+          # the reference) and is harmless.
+          CARGO_HOME: C:\Users\runneradmin\.cargo
+          CARGO_INCREMENTAL: "0"
+          CACHE_ON_FAILURE: "false"
         run: |
           $ErrorActionPreference = 'Stop'
           # Build the GUI app AND the CLI, with the static CRT so the MSI needs
