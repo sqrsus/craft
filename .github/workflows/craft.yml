@@ -16,22 +16,27 @@
 # WiX Toolset v3 (downloaded from the official release, pinned to 3.14.1). The
 # WiX source is GENERATED INLINE inside the step (so the build never depends on a
 # separately committed file being present), then filled via candle preprocessor
-# variables. Output: artifacts/<repo>/<pkg>-<ver>-windows-x64.msi
+# variables. Output (MSI only): artifacts/<repo>/<pkg>-<ver>-dev-windows-x64.msi
+# (.exe / .pdb / build.log are intermediate products and are NOT uploaded).
 #
-# Trigger: manual only (workflow_dispatch).
+# Trigger: scheduled daily at 08:30 Asia/Shanghai (UTC 00:30) AND manual
+# (workflow_dispatch) with the inputs below.
 #   - build_photocraft / build_cadcraft : build each repo independently
 #   - clean_cache                       : skip restoring AND saving the Cargo cache
 #   - rust_toolchain                    : Rust toolchain (stable >= 1.95 works)
 #
 # Behavior on failure: jobs are independent (parallel by default); one failing
-# does not cancel the other. Each job always uploads its build log (even on
-# failure) and prints the log tail; the final "summary" job always runs and
-# writes a result table to the run summary.
+# does not cancel the other. Each job prints its build.log tail on failure;
+# the final "summary" job always runs and writes a result table to the run
+# summary.
 # =============================================================================
 
 name: Build craft Upstream (Windows x64)
 
 on:
+  # 08:30 Beijing time (Asia/Shanghai, UTC+8) == 00:30 UTC
+  schedule:
+    - cron: "30 0 * * *"
   workflow_dispatch:
     inputs:
       build_photocraft:
@@ -128,18 +133,9 @@ jobs:
             exit 1
           }
 
-      - name: Collect artifacts
-        if: ${{ always() }}
-        working-directory: photocraft
-        shell: pwsh
-        run: |
-          $stage = '../artifacts/photocraft'
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item 'target/release/photocraft.exe' $stage -ErrorAction SilentlyContinue
-          if (Test-Path 'target/release/photocraft.pdb') {
-            Copy-Item 'target/release/photocraft.pdb' $stage
-          }
-          if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
+      # Only the MSI is collected/uploaded. The .exe / .pdb / build.log are
+      # intermediate products consumed by the MSI step and are intentionally NOT
+      # packaged or uploaded (MSI-only artifacts rule).
 
       - name: Install WiX Toolset v3 (pinned 3.14.1)
         if: ${{ inputs.build_msi }}
@@ -175,13 +171,21 @@ jobs:
                   ConvertFrom-Json
           $ver = ($meta.packages | Where-Object { $_.name -eq $env:PKG_NAME }).version
           if (-not $ver) { $ver = '0.0.0' }
-          # MSI ProductVersion must be major.minor.build (<= 3 numeric parts).
+          # MSI ProductVersion must be major.minor.build (<= 3 numeric parts) AND
+          # must stay NUMERIC (WiX rejects letters). Strip pre-release/build
+          # metadata first, then pad to exactly 3 numeric parts.
           $ver = ($ver -split '[-+]')[0]
           $parts = ($ver.Split('.') | Select-Object -First 3)
           while ($parts.Count -lt 3) { $parts += '0' }
           $ver = $parts -join '.'
-          # Match the source repo's MSI naming: <pkg>-<version>-windows-x64.msi
-          $msi = "artifacts/$repo/$env:PKG_NAME-$ver-windows-x64.msi"
+          # The "-dev" marker is added ONLY to the output FILE name so this build
+          # is distinguishable from the upstream release MSI (no -dev) without ever
+          # reaching WiX (which would reject the letters). The internal
+          # ProductVersion below stays numeric.
+          $devVer = "$ver-dev"
+          # Match the source repo's MSI naming, with a -dev suffix:
+          # <pkg>-<version>-dev-windows-x64.msi
+          $msi = "artifacts/$repo/$env:PKG_NAME-$devVer-windows-x64.msi"
           New-Item -ItemType Directory -Force -Path "artifacts/$repo" | Out-Null
           # Generate the WiX source inline so the build never depends on a
           # separately committed file being present in the checkout.
@@ -252,7 +256,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: photocraft-windows-x64
-          path: artifacts/photocraft/
+          path: artifacts/photocraft/*.msi
           if-no-files-found: warn
           retention-days: 14
 
@@ -320,18 +324,9 @@ jobs:
             exit 1
           }
 
-      - name: Collect artifacts
-        if: ${{ always() }}
-        working-directory: cadcraft
-        shell: pwsh
-        run: |
-          $stage = '../artifacts/cadcraft'
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item 'target/release/cadcraft.exe' $stage -ErrorAction SilentlyContinue
-          if (Test-Path 'target/release/cadcraft.pdb') {
-            Copy-Item 'target/release/cadcraft.pdb' $stage
-          }
-          if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
+      # Only the MSI is collected/uploaded. The .exe / .pdb / build.log are
+      # intermediate products consumed by the MSI step and are intentionally NOT
+      # packaged or uploaded (MSI-only artifacts rule).
 
       - name: Install WiX Toolset v3 (pinned 3.14.1)
         if: ${{ inputs.build_msi }}
@@ -364,12 +359,21 @@ jobs:
                   ConvertFrom-Json
           $ver = ($meta.packages | Where-Object { $_.name -eq $env:PKG_NAME }).version
           if (-not $ver) { $ver = '0.0.0' }
+          # MSI ProductVersion must be major.minor.build (<= 3 numeric parts) AND
+          # must stay NUMERIC (WiX rejects letters). Strip pre-release/build
+          # metadata first, then pad to exactly 3 numeric parts.
           $ver = ($ver -split '[-+]')[0]
           $parts = ($ver.Split('.') | Select-Object -First 3)
           while ($parts.Count -lt 3) { $parts += '0' }
           $ver = $parts -join '.'
-          # Match the source repo's MSI naming: <pkg>-<version>-windows-x64.msi
-          $msi = "artifacts/$repo/$env:PKG_NAME-$ver-windows-x64.msi"
+          # The "-dev" marker is added ONLY to the output FILE name so this build
+          # is distinguishable from the upstream release MSI (no -dev) without ever
+          # reaching WiX (which would reject the letters). The internal
+          # ProductVersion below stays numeric.
+          $devVer = "$ver-dev"
+          # Match the source repo's MSI naming, with a -dev suffix:
+          # <pkg>-<version>-dev-windows-x64.msi
+          $msi = "artifacts/$repo/$env:PKG_NAME-$devVer-windows-x64.msi"
           New-Item -ItemType Directory -Force -Path "artifacts/$repo" | Out-Null
           # Generate the WiX source inline so the build never depends on a
           # separately committed file being present in the checkout.
@@ -438,7 +442,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cadcraft-windows-x64
-          path: artifacts/cadcraft/
+          path: artifacts/cadcraft/*.msi
           if-no-files-found: warn
           retention-days: 14
 
@@ -484,6 +488,6 @@ jobs:
           }
           if ('${{ inputs.build_msi }}' -eq 'true') {
             $lines += ''
-            $lines += 'MSI installers (when built) are included in the per-repo artifacts (e.g. photocraft-0.8.2-windows-x64.msi).'
+            $lines += 'MSI installers (when built) are included in the per-repo artifacts (e.g. photocraft-0.8.2-dev-windows-x64.msi).'
           }
           $lines -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
