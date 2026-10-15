@@ -1,32 +1,57 @@
 # =============================================================================
 # Build Upstream craft Repos - Windows x64 only (no Linux/macOS matrix)
 #
-# Targets (verified 2026-10-13):
+# Targets (verified 2026-10-15):
 #   - storytold/photocraft : pure-Rust image editor (Cargo workspace, rust 1.95)
 #                             main app package: apps/photocraft -> photocraft.exe
 #   - storytold/cadcraft   : pure-Rust CAD app      (Cargo workspace, rust 1.90,
 #                             desktop/web UI builds require 1.95+)
 #                             main package: cadcraft -> cadcraft.exe
+#   - storytold/pdfcraft   : pure-Rust PDF reader/editor (Cargo workspace,
+#                             rust-version 1.95)
+#                             main package: apps/pdfcraft -> pdfcraft.exe
+#                             CLI package:  apps/pdfcraft-cli -> pdfcraft-cli.exe
+#   - storytold/wordcraft  : pure-Rust Word reimplementation (Cargo workspace,
+#                             rust-version 1.90)
+#                             main package: apps/wordcraft -> wordcraft.exe
+#                             CLI package:  apps/wordcraft-cli -> wordcraft-cli.exe
 #
-# NOTE: Neither repo uses Node.js / npm / pnpm / Electron. The only toolchain
+# NOTE: None of the repos use Node.js / npm / pnpm / Electron. The only toolchain
 # required is Rust (MSVC host triple on windows-latest). Trunk + wasm32 target
 # are only needed for the optional web builds and are NOT part of this flow.
 #
-# Output: EXE only. No MSI / installer packaging is performed - the WiX Toolset
-# download step, the MSI compile step and the build_msi input have all been
-# removed. Each job stages its release binaries into artifacts/<repo>/ and
-# uploads that directory:
+# pdfcraft / wordcraft are built exactly the way their own
+# packaging/windows/package.ps1 builds them: an explicit --target
+# x86_64-pc-windows-msvc, -C target-feature=+crt-static (static CRT, so no
+# Visual C++ redistributable is needed) and the repo's *_REQUIRE_WINRES=1 flag
+# (fail, rather than warn, if the icon/VERSIONINFO cannot be embedded). Because
+# --target is passed, their binaries land in target/<triple>/release/. Their
+# MSI / portable-zip / signing steps are NOT part of this flow.
+#
+# Output: EXE only. No MSI / installer packaging is performed - no WiX install
+# step, no MSI compile step and no build_msi input exist in this workflow. Each
+# job stages its release binaries into artifacts/<repo>/ and uploads that
+# directory:
 #   artifacts/photocraft/ <- photocraft.exe (+ photocraft.pdb, build.log)
 #   artifacts/cadcraft/   <- cadcraft.exe   (+ cadcraft.pdb,   build.log)
+#   artifacts/pdfcraft/   <- pdfcraft.exe   (+ pdfcraft.pdb,   build.log)
+#   artifacts/wordcraft/  <- wordcraft.exe  (+ wordcraft.pdb,  build.log)
 #
 # Trigger: scheduled daily at 08:30 Asia/Shanghai (UTC 00:30) AND manual
 # (workflow_dispatch) with the inputs below.
-#   - build_photocraft / build_cadcraft : build each repo independently
+#   - build_photocraft / build_cadcraft / build_pdfcraft / build_wordcraft :
+#                                       build each repo independently
 #   - clean_cache                       : skip restoring AND saving the Cargo cache
 #   - rust_toolchain                    : Rust toolchain (stable >= 1.95 works)
 #
+# NOTE on inputs during scheduled runs: on a non-workflow_dispatch event the
+# `inputs` context is empty (every input is null) - it does NOT fall back to the
+# declared defaults. Guards therefore read
+# `github.event_name != 'workflow_dispatch' || inputs.<flag>`, so the daily run
+# builds every repo while a manual run honours its checkboxes.
+#
 # Behavior on failure: jobs are independent (parallel by default); one failing
-# does not cancel the other. Each job stages and uploads its artifacts (even on
+# does not cancel the others. Each job stages and uploads its artifacts (even on
 # failure) and prints the build.log tail; the final "summary" job always runs
 # and writes a result table to the run summary.
 # =============================================================================
@@ -47,12 +72,20 @@ on:
         description: "Build storytold/cadcraft"
         type: boolean
         default: true
+      build_pdfcraft:
+        description: "Build storytold/pdfcraft"
+        type: boolean
+        default: true
+      build_wordcraft:
+        description: "Build storytold/wordcraft"
+        type: boolean
+        default: true
       clean_cache:
         description: "Do not restore or save the Cargo build cache"
         type: boolean
         default: false
       rust_toolchain:
-        description: "Rust toolchain version (cadcraft desktop needs >= 1.95)"
+        description: "Rust toolchain version (pdfcraft/cadcraft need >= 1.95)"
         type: string
         default: "stable"
 
@@ -67,7 +100,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  # Both repos pull git dependencies from github.com/storytold/craft-libs.
+  # The repos pull git dependencies from github.com/storytold/craft-libs.
   # Using the git CLI is more reliable on Windows runners than libgit2.
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
@@ -77,7 +110,9 @@ jobs:
   # ===========================================================================
   build-photocraft:
     name: "photocraft (windows-latest, x64)"
-    if: ${{ inputs.build_photocraft }}
+    # Scheduled runs have no inputs (all null), so only a manual dispatch can
+    # turn this job off - otherwise the daily run would skip every build.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_photocraft }}
     runs-on: windows-latest
     steps:
       - name: Checkout storytold/photocraft
@@ -92,7 +127,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ inputs.rust_toolchain }}
+          toolchain: ${{ inputs.rust_toolchain || 'stable' }}
           # Explicit host triple; windows-latest defaults to this anyway.
           targets: x86_64-pc-windows-msvc
 
@@ -168,7 +203,7 @@ jobs:
   # ===========================================================================
   build-cadcraft:
     name: "cadcraft (windows-latest, x64)"
-    if: ${{ inputs.build_cadcraft }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_cadcraft }}
     runs-on: windows-latest
     steps:
       - name: Checkout storytold/cadcraft
@@ -182,7 +217,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ inputs.rust_toolchain }}
+          toolchain: ${{ inputs.rust_toolchain || 'stable' }}
           targets: x86_64-pc-windows-msvc
 
       - name: Cache Cargo registry and build
@@ -248,11 +283,197 @@ jobs:
           }
 
   # ===========================================================================
-  # Job 3: always-on summary (runs even if a build job fails)
+  # Job 3: pdfcraft (Rust PDF reader / editor)
+  # ===========================================================================
+  build-pdfcraft:
+    name: "pdfcraft (windows-latest, x64)"
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_pdfcraft }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout storytold/pdfcraft
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/pdfcraft
+          ref: main
+          path: pdfcraft
+          # Add token: ${{ secrets.UPSTREAM_PAT }} if the repo is private.
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ inputs.rust_toolchain || 'stable' }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo registry and build
+        if: ${{ !inputs.clean_cache }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pdfcraft
+          key: pdfcraft-windows-x64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build release binaries (cargo build --release -p pdfcraft -p pdfcraft-cli)
+        working-directory: pdfcraft
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Match the source repo's packaging/windows/package.ps1: build the GUI app
+          # AND the CLI for the explicit MSVC target, with the static CRT so the
+          # binaries need no Visual C++ redistributable. PDFCRAFT_REQUIRE_WINRES makes
+          # a failed icon/VERSIONINFO embed an error instead of a warning (Windows SDK
+          # rc.exe is present on windows-latest). The MSI / portable-zip / signing
+          # steps of that script are intentionally NOT part of this flow.
+          $target = 'x86_64-pc-windows-msvc'
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
+          $env:PDFCRAFT_REQUIRE_WINRES = '1'
+          cargo build --release --locked -p pdfcraft -p pdfcraft-cli --target $target *>&1 |
+            Tee-Object -FilePath build.log
+          $code = $LASTEXITCODE
+          Write-Host "cargo build exit code: $code"
+          if ($code -ne 0) { exit $code }
+          # Sanity check: both expected output binaries must exist. Because --target
+          # is passed, the output lives under target/<triple>/release/.
+          if (-not (Test-Path "target/$target/release/pdfcraft.exe")) {
+            Write-Error "pdfcraft.exe not found under target/$target/release/"
+            exit 1
+          }
+          if (-not (Test-Path "target/$target/release/pdfcraft-cli.exe")) {
+            Write-Error "pdfcraft-cli.exe not found under target/$target/release/"
+            exit 1
+          }
+
+      - name: Collect artifacts
+        if: ${{ always() }}
+        working-directory: pdfcraft
+        shell: pwsh
+        run: |
+          $target = 'x86_64-pc-windows-msvc'
+          $stage = '../artifacts/pdfcraft'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/$target/release/pdfcraft.exe" $stage -ErrorAction SilentlyContinue
+          if (Test-Path "target/$target/release/pdfcraft.pdb") {
+            Copy-Item "target/$target/release/pdfcraft.pdb" $stage
+          }
+          if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
+
+      - name: Upload artifact (pdfcraft-windows-x64)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfcraft-windows-x64
+          path: artifacts/pdfcraft/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Print build log tail on failure
+        if: ${{ failure() }}
+        working-directory: pdfcraft
+        shell: pwsh
+        run: |
+          if (Test-Path 'build.log') {
+            Write-Host '----- build.log (last 200 lines) -----'
+            Get-Content 'build.log' -Tail 200
+          }
+
+  # ===========================================================================
+  # Job 4: wordcraft (Rust Word reimplementation)
+  # ===========================================================================
+  build-wordcraft:
+    name: "wordcraft (windows-latest, x64)"
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_wordcraft }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout storytold/wordcraft
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/wordcraft
+          ref: main
+          path: wordcraft
+          # Add token: ${{ secrets.UPSTREAM_PAT }} if the repo is private.
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ inputs.rust_toolchain || 'stable' }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo registry and build
+        if: ${{ !inputs.clean_cache }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wordcraft
+          key: wordcraft-windows-x64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build release binaries (cargo build --release -p wordcraft -p wordcraft-cli)
+        working-directory: wordcraft
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Match the source repo's packaging/windows/package.ps1: build the GUI app
+          # AND the CLI for the explicit MSVC target, with the static CRT so the
+          # binaries need no Visual C++ redistributable. WORDCRAFT_REQUIRE_WINRES makes
+          # a failed icon/VERSIONINFO embed an error instead of a warning (Windows SDK
+          # rc.exe is present on windows-latest). The MSI / portable-zip / signing
+          # steps of that script are intentionally NOT part of this flow.
+          $target = 'x86_64-pc-windows-msvc'
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
+          $env:WORDCRAFT_REQUIRE_WINRES = '1'
+          cargo build --release --locked -p wordcraft -p wordcraft-cli --target $target *>&1 |
+            Tee-Object -FilePath build.log
+          $code = $LASTEXITCODE
+          Write-Host "cargo build exit code: $code"
+          if ($code -ne 0) { exit $code }
+          # Sanity check: both expected output binaries must exist. Because --target
+          # is passed, the output lives under target/<triple>/release/.
+          if (-not (Test-Path "target/$target/release/wordcraft.exe")) {
+            Write-Error "wordcraft.exe not found under target/$target/release/"
+            exit 1
+          }
+          if (-not (Test-Path "target/$target/release/wordcraft-cli.exe")) {
+            Write-Error "wordcraft-cli.exe not found under target/$target/release/"
+            exit 1
+          }
+
+      - name: Collect artifacts
+        if: ${{ always() }}
+        working-directory: wordcraft
+        shell: pwsh
+        run: |
+          $target = 'x86_64-pc-windows-msvc'
+          $stage = '../artifacts/wordcraft'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/$target/release/wordcraft.exe" $stage -ErrorAction SilentlyContinue
+          if (Test-Path "target/$target/release/wordcraft.pdb") {
+            Copy-Item "target/$target/release/wordcraft.pdb" $stage
+          }
+          if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
+
+      - name: Upload artifact (wordcraft-windows-x64)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: wordcraft-windows-x64
+          path: artifacts/wordcraft/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Print build log tail on failure
+        if: ${{ failure() }}
+        working-directory: wordcraft
+        shell: pwsh
+        run: |
+          if (Test-Path 'build.log') {
+            Write-Host '----- build.log (last 200 lines) -----'
+            Get-Content 'build.log' -Tail 200
+          }
+
+  # ===========================================================================
+  # Job 5: always-on summary (runs even if a build job fails)
   # ===========================================================================
   summary:
     name: "Build summary"
-    needs: [build-photocraft, build-cadcraft]
+    needs: [build-photocraft, build-cadcraft, build-pdfcraft, build-wordcraft]
     if: ${{ always() }}
     runs-on: windows-latest
     steps:
@@ -261,6 +482,8 @@ jobs:
         run: |
           $pc = '${{ needs.build-photocraft.result }}'
           $cc = '${{ needs.build-cadcraft.result }}'
+          $pd = '${{ needs.build-pdfcraft.result }}'
+          $wc = '${{ needs.build-wordcraft.result }}'
           $lines = @(
             '## Upstream build results (Windows x64)',
             '',
@@ -268,12 +491,15 @@ jobs:
             '| --- | ------ | -------- |',
             "| photocraft | $pc | photocraft-windows-x64 |",
             "| cadcraft | $cc | cadcraft-windows-x64 |",
+            "| pdfcraft | $pd | pdfcraft-windows-x64 |",
+            "| wordcraft | $wc | wordcraft-windows-x64 |",
             ''
           )
-          if ($pc -eq 'failure' -or $cc -eq 'failure') {
+          $results = @($pc, $cc, $pd, $wc)
+          if ($results -contains 'failure') {
             $lines += 'At least one build FAILED - see the failed job log and the build.log inside its artifact.'
-          } elseif ($pc -eq 'skipped' -and $cc -eq 'skipped') {
-            $lines += 'Both builds were skipped via workflow_dispatch inputs.'
+          } elseif ($results -notcontains 'success') {
+            $lines += 'All builds were skipped via workflow_dispatch inputs.'
           } else {
             $lines += 'All requested builds succeeded. Download artifacts from the run page.'
           }
