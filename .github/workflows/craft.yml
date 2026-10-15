@@ -22,11 +22,16 @@
 #
 # pdfcraft / wordcraft are built exactly the way their own
 # packaging/windows/package.ps1 builds them: an explicit --target
-# x86_64-pc-windows-msvc, -C target-feature=+crt-static (static CRT, so no
-# Visual C++ redistributable is needed) and the repo's *_REQUIRE_WINRES=1 flag
-# (fail, rather than warn, if the icon/VERSIONINFO cannot be embedded). Because
-# --target is passed, their binaries land in target/<triple>/release/. Their
-# MSI / portable-zip / signing steps are NOT part of this flow.
+# x86_64-pc-windows-msvc and the repo's *_REQUIRE_WINRES=1 flag
+# (fail, rather than warn, if the icon/VERSIONINFO cannot be embedded). The CRT
+# is linked DYNAMICALLY here (the runner already has the Visual C++ redistributable
+# installed), producing a smaller EXE than the source repo's static-CRT build.
+# Because --target is passed, their binaries land in target/<triple>/release/.
+# Their MSI / portable-zip / signing steps are NOT part of this flow.
+#
+# Only the GUI app is built for every repo; the matching *-cli package is
+# intentionally NOT built or packaged here (the upload artifact contains just the
+# single .exe per repo, with no .pdb or build.log).
 #
 # Output: EXE only. No MSI / installer packaging is performed - no WiX install
 # step, no MSI compile step and no build_msi input exist in this workflow. Each
@@ -103,6 +108,12 @@ env:
   # The repos pull git dependencies from github.com/storytold/craft-libs.
   # Using the git CLI is more reliable on Windows runners than libgit2.
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Size-reduction profile (injected so we don't have to touch the upstream
+  # Cargo.toml): strip release symbols, optimize for size ("z") instead of
+  # speed ("3"), and abort instead of unwinding on panic (drops unwind code).
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+  CARGO_PROFILE_RELEASE_OPT_LEVEL: "z"
+  CARGO_PROFILE_RELEASE_PANIC: "abort"
 
 jobs:
   # ===========================================================================
@@ -141,26 +152,24 @@ jobs:
           key: photocraft-windows-x64
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release binaries (cargo build --release -p photocraft -p photocraft-cli --features heif)
+      - name: Build release binaries (cargo build --release -p photocraft --features heif)
         working-directory: photocraft
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Match the source repo's packaging: build the GUI app AND the CLI, with the
-          # static CRT so the portable build needs no Visual C++ redistributable.
-          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
-          cargo build --release --locked -p photocraft -p photocraft-cli --features heif *>&1 |
+          # Match the source repo's packaging: build the GUI app. The CRT is linked
+          # dynamically (the runner has the Visual C++ redistributable installed), so
+          # the EXE is smaller than a static-CRT build. The CLI is intentionally NOT
+          # built here.
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=-crt-static'
+          cargo build --release --locked -p photocraft --features heif *>&1 |
             Tee-Object -FilePath build.log
           $code = $LASTEXITCODE
           Write-Host "cargo build exit code: $code"
           if ($code -ne 0) { exit $code }
-          # Sanity check: both expected output binaries must exist.
+          # Sanity check: the expected output binary must exist.
           if (-not (Test-Path 'target/release/photocraft.exe')) {
             Write-Error 'photocraft.exe not found under target/release/'
-            exit 1
-          }
-          if (-not (Test-Path 'target/release/photocraft-cli.exe')) {
-            Write-Error 'photocraft-cli.exe not found under target/release/'
             exit 1
           }
 
@@ -172,17 +181,13 @@ jobs:
           $stage = '../artifacts/photocraft'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item 'target/release/photocraft.exe' $stage -ErrorAction SilentlyContinue
-          if (Test-Path 'target/release/photocraft.pdb') {
-            Copy-Item 'target/release/photocraft.pdb' $stage
-          }
-          if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
 
       - name: Upload artifact (photocraft-windows-x64)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: photocraft-windows-x64
-          path: artifacts/photocraft/
+          path: artifacts/photocraft/*.exe
           if-no-files-found: warn
           retention-days: 14
 
@@ -228,25 +233,23 @@ jobs:
           key: cadcraft-windows-x64
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release binaries (cargo build --release -p cadcraft -p cadcraft-cli)
+      - name: Build release binaries (cargo build --release -p cadcraft)
         working-directory: cadcraft
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Match the source repo's packaging: build the GUI app AND the CLI, with the
-          # static CRT so the portable build needs no Visual C++ redistributable.
-          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
-          cargo build --release --locked -p cadcraft -p cadcraft-cli *>&1 |
+          # Match the source repo's packaging: build the GUI app. The CRT is linked
+          # dynamically (the runner has the Visual C++ redistributable installed), so
+          # the EXE is smaller than a static-CRT build. The CLI is intentionally NOT
+          # built here.
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=-crt-static'
+          cargo build --release --locked -p cadcraft *>&1 |
             Tee-Object -FilePath build.log
           $code = $LASTEXITCODE
           Write-Host "cargo build exit code: $code"
           if ($code -ne 0) { exit $code }
           if (-not (Test-Path 'target/release/cadcraft.exe')) {
             Write-Error 'cadcraft.exe not found under target/release/'
-            exit 1
-          }
-          if (-not (Test-Path 'target/release/cadcraft-cli.exe')) {
-            Write-Error 'cadcraft-cli.exe not found under target/release/'
             exit 1
           }
 
@@ -258,17 +261,13 @@ jobs:
           $stage = '../artifacts/cadcraft'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item 'target/release/cadcraft.exe' $stage -ErrorAction SilentlyContinue
-          if (Test-Path 'target/release/cadcraft.pdb') {
-            Copy-Item 'target/release/cadcraft.pdb' $stage
-          }
-          if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
 
       - name: Upload artifact (cadcraft-windows-x64)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: cadcraft-windows-x64
-          path: artifacts/cadcraft/
+          path: artifacts/cadcraft/*.exe
           if-no-files-found: warn
           retention-days: 14
 
@@ -312,33 +311,30 @@ jobs:
           key: pdfcraft-windows-x64
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release binaries (cargo build --release -p pdfcraft -p pdfcraft-cli)
+      - name: Build release binaries (cargo build --release -p pdfcraft)
         working-directory: pdfcraft
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           # Match the source repo's packaging/windows/package.ps1: build the GUI app
-          # AND the CLI for the explicit MSVC target, with the static CRT so the
-          # binaries need no Visual C++ redistributable. PDFCRAFT_REQUIRE_WINRES makes
-          # a failed icon/VERSIONINFO embed an error instead of a warning (Windows SDK
-          # rc.exe is present on windows-latest). The MSI / portable-zip / signing
-          # steps of that script are intentionally NOT part of this flow.
+          # for the explicit MSVC target. The CRT is linked dynamically (the runner
+          # has the Visual C++ redistributable installed), so the EXE is smaller than
+          # the source repo's static-CRT build. PDFCRAFT_REQUIRE_WINRES makes a failed
+          # icon/VERSIONINFO embed an error instead of a warning (Windows SDK rc.exe is
+          # present on windows-latest). The CLI / MSI / portable-zip / signing steps of
+          # that script are intentionally NOT part of this flow.
           $target = 'x86_64-pc-windows-msvc'
-          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=-crt-static'
           $env:PDFCRAFT_REQUIRE_WINRES = '1'
-          cargo build --release --locked -p pdfcraft -p pdfcraft-cli --target $target *>&1 |
+          cargo build --release --locked -p pdfcraft --target $target *>&1 |
             Tee-Object -FilePath build.log
           $code = $LASTEXITCODE
           Write-Host "cargo build exit code: $code"
           if ($code -ne 0) { exit $code }
-          # Sanity check: both expected output binaries must exist. Because --target
-          # is passed, the output lives under target/<triple>/release/.
+          # Sanity check: the expected output binary must exist. Because --target is
+          # passed, the output lives under target/<triple>/release/.
           if (-not (Test-Path "target/$target/release/pdfcraft.exe")) {
             Write-Error "pdfcraft.exe not found under target/$target/release/"
-            exit 1
-          }
-          if (-not (Test-Path "target/$target/release/pdfcraft-cli.exe")) {
-            Write-Error "pdfcraft-cli.exe not found under target/$target/release/"
             exit 1
           }
 
@@ -351,17 +347,13 @@ jobs:
           $stage = '../artifacts/pdfcraft'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/$target/release/pdfcraft.exe" $stage -ErrorAction SilentlyContinue
-          if (Test-Path "target/$target/release/pdfcraft.pdb") {
-            Copy-Item "target/$target/release/pdfcraft.pdb" $stage
-          }
-          if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
 
       - name: Upload artifact (pdfcraft-windows-x64)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: pdfcraft-windows-x64
-          path: artifacts/pdfcraft/
+          path: artifacts/pdfcraft/*.exe
           if-no-files-found: warn
           retention-days: 14
 
@@ -405,33 +397,30 @@ jobs:
           key: wordcraft-windows-x64
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release binaries (cargo build --release -p wordcraft -p wordcraft-cli)
+      - name: Build release binaries (cargo build --release -p wordcraft)
         working-directory: wordcraft
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           # Match the source repo's packaging/windows/package.ps1: build the GUI app
-          # AND the CLI for the explicit MSVC target, with the static CRT so the
-          # binaries need no Visual C++ redistributable. WORDCRAFT_REQUIRE_WINRES makes
-          # a failed icon/VERSIONINFO embed an error instead of a warning (Windows SDK
-          # rc.exe is present on windows-latest). The MSI / portable-zip / signing
-          # steps of that script are intentionally NOT part of this flow.
+          # for the explicit MSVC target. The CRT is linked dynamically (the runner
+          # has the Visual C++ redistributable installed), so the EXE is smaller than
+          # the source repo's static-CRT build. WORDCRAFT_REQUIRE_WINRES makes a failed
+          # icon/VERSIONINFO embed an error instead of a warning (Windows SDK rc.exe is
+          # present on windows-latest). The CLI / MSI / portable-zip / signing steps of
+          # that script are intentionally NOT part of this flow.
           $target = 'x86_64-pc-windows-msvc'
-          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=-crt-static'
           $env:WORDCRAFT_REQUIRE_WINRES = '1'
-          cargo build --release --locked -p wordcraft -p wordcraft-cli --target $target *>&1 |
+          cargo build --release --locked -p wordcraft --target $target *>&1 |
             Tee-Object -FilePath build.log
           $code = $LASTEXITCODE
           Write-Host "cargo build exit code: $code"
           if ($code -ne 0) { exit $code }
-          # Sanity check: both expected output binaries must exist. Because --target
-          # is passed, the output lives under target/<triple>/release/.
+          # Sanity check: the expected output binary must exist. Because --target is
+          # passed, the output lives under target/<triple>/release/.
           if (-not (Test-Path "target/$target/release/wordcraft.exe")) {
             Write-Error "wordcraft.exe not found under target/$target/release/"
-            exit 1
-          }
-          if (-not (Test-Path "target/$target/release/wordcraft-cli.exe")) {
-            Write-Error "wordcraft-cli.exe not found under target/$target/release/"
             exit 1
           }
 
@@ -444,17 +433,13 @@ jobs:
           $stage = '../artifacts/wordcraft'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/$target/release/wordcraft.exe" $stage -ErrorAction SilentlyContinue
-          if (Test-Path "target/$target/release/wordcraft.pdb") {
-            Copy-Item "target/$target/release/wordcraft.pdb" $stage
-          }
-          if (Test-Path 'build.log') { Copy-Item 'build.log' $stage }
 
       - name: Upload artifact (wordcraft-windows-x64)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: wordcraft-windows-x64
-          path: artifacts/wordcraft/
+          path: artifacts/wordcraft/*.exe
           if-no-files-found: warn
           retention-days: 14
 
