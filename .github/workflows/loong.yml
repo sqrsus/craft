@@ -1,0 +1,337 @@
+# PhotoCraft on LoongArch64, "old world" (龙芯旧世界 / LoongArch ABI 1.0).
+#
+# Builds the headless `photocraft-cli` for old-world LoongArch: Loongnix 20, UOS V20, Kylin V10.
+# Those systems ship a vendor kernel 4.19 and glibc 2.28, and their ELF objects carry ABI flag
+# OBJ-v0 with the interpreter `/lib64/ld.so.1`.
+#
+# Why the toolchain is not the ordinary one
+# -----------------------------------------
+# Rust's official `loongarch64-unknown-linux-gnu` target is the *new* world: its prebuilt
+# `libstd` is linked against glibc 2.36 and requires kernel 5.19, so anything built with it dies
+# on an old-world machine with `/lib64/ld-linux-loongarch-lp64d.so.1: not found` or a
+# `GLIBC_2.36 not found` symbol error. Versioned-symbol scan of a probe binary built with the
+# official toolchain: max GLIBC_2.36, interpreter /lib64/ld-linux-loongarch-lp64d.so.1.
+#
+# Loongson publishes an old-world Rust toolchain (ABI 1.0) that fixes this: its `libstd` tops out
+# at GLIBC_2.28, embeds the old-world interpreter and links against the vendor glibc 2.28
+# sysroot. That is what this workflow installs from https://rust-lang.loongnix.cn (the rustup
+# mirror documented at https://docs.loongnix.cn/rust/rustup.html). Their dist ships an
+# **x86_64 host** rustc plus the loongarch64 std, which is why a plain GitHub-hosted x86_64
+# runner can cross-compile for old world without a LoongArch machine.
+#
+# Verified on 2026-10-19 against rustc 1.99.0 (a4d5d3f0e 2026-10-09): the resulting
+# photocraft-cli has max GLIBC_2.28, INTERP /lib64/ld.so.1, LoongArch ABI version 0. The whole
+# CLI closure compiles unchanged for both the `dev` and `release` (thin LTO) profiles; the
+# workspace has no x86-only code on this path.
+#
+# The three moving parts, and why each is needed
+# ----------------------------------------------
+# 1. rustc + rust-std: Loongson's, for the old-world ABI. rustc and std must come from the SAME
+#    build (mixing them gives E0514 "found crate `std` compiled by an incompatible version of
+#    rustc"), which is why the official rustc is not used.
+# 2. cargo: the ordinary one from crates.io. Loongson's cargo hardcodes the crates.loongnix.cn
+#    mirror, whose index lacks several versions PhotoCraft pins (`ruzstd 0.9.1` fails to
+#    resolve there). Pairing the official cargo with Loongson's rustc via RUSTC= works, and
+#    crates.io has every pinned version. This is also why CARGO_HOME is set per-run instead of
+#    using Loongson's cargo.
+# 3. linker: Loongson's GNU toolchain 8.3 cross build (binutils 2.31, GCC 8.3, glibc 2.28
+#    sysroot). Its ld emits the ABI-v0 flag and links against glibc 2.28; a modern Debian
+#    loong64 cross gcc links against glibc 2.41 and produces a new-world binary.
+#
+# Testing
+# -------
+# The build is verified structurally (ELF interpreter, ABI flags, and the highest GLIBC symbol
+# version, all asserted below), not by executing the binary: QEMU's linux-user mode implements
+# the *upstream* LoongArch syscall ABI, so old-world binaries abort under it (their 16-byte
+# sigset in rt_sigaction is rejected with EINVAL by a kernel expecting the new layout). Run the
+# artifact on a real old-world machine, or in an old-world container/VM.
+name: LoongArch old world
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile to build"
+        type: choice
+        options: [release, dev]
+        default: release
+      features:
+        description: "Extra cargo features (blank = none; official builds use `heif`)"
+        default: ""
+      verify_abi:
+        description: "Fail if the binary is not a valid old-world ELF"
+        type: boolean
+        default: true
+
+concurrency:
+  group: loongarch-oldworld-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Rust and cargo spend a lot of RAM on a cold build of ~500 crates; keep jobs predictable.
+  CARGO_NET_RETRY: "5"
+
+jobs:
+  build:
+    name: photocraft-cli (loongarch64 old world)
+    # A cold build of the CLI closure measured ~25 min on a 6-core x86_64 host; keep headroom.
+    timeout-minutes: 180
+    runs-on: ubuntu-24.04
+
+    env:
+      # Pinned so a mirror update cannot silently change the ABI we ship. Bump deliberately:
+      # https://rust-lang.loongnix.cn/dist/channel-rust-stable.toml lists the current one.
+      LOONGNIX_DIST: "https://rust-lang.loongnix.cn/dist/1.99.0/2026-10-09"
+      LOONGNIX_TRIPLE: loongarch64-unknown-linux-gnu
+      # Loongson's old-world cross toolchain (binutils 2.31 / GCC 8.3 / glibc 2.28 sysroot).
+      GCC8_URL: "https://ftp.loongnix.cn/toolchain/gcc/release/loongarch/gcc8/loongson-gnu-toolchain-8.3-x86_64-loongarch64-linux-gnu-rc1.6.tar.xz"
+      TOOLCHAIN_ROOT: ${{ github.workspace }}/.loongarch
+      LOONGNIX_PREFIX: ${{ github.workspace }}/.loongarch/rust
+      CARGO_HOME: ${{ github.workspace }}/.loongarch/cargo
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Check the host toolchain has an ordinary cargo
+        run: |
+          # GitHub's ubuntu images ship rustup + a stable cargo. We only need `cargo` from it:
+          # the compiler and std are Loongson's (see the header), selected through RUSTC.
+          command -v cargo >/dev/null || { echo "::error::no cargo on the runner"; exit 1; }
+          cargo -V
+
+      - name: Cache the LoongArch toolchains and cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            .loongarch/gcc8
+            .loongarch/rust
+            .loongarch/cargo
+            .loongarch/downloads
+          # The toolchain URLs are pinned in `env`, but a cache key cannot read `env`, so the
+          # same version strings are repeated here. Keep the two in sync when bumping.
+          key: loongnix-abi1.0-rust1.99.0-20261009-gcc8rc1.6-v1
+
+      - name: Fetch Loongson's old-world Rust and GCC 8.3 toolchains
+        run: |
+          set -euo pipefail
+          mkdir -p "$TOOLCHAIN_ROOT/downloads"
+          cd "$TOOLCHAIN_ROOT/downloads"
+
+          # --- Rust (ABI 1.0) -------------------------------------------------------------
+          # rustc for the x86_64 host, plus rust-std for BOTH the loongarch64 target and the
+          # x86_64 host: build scripts and proc-macros are compiled for the host, so a target
+          # std alone gives "can't find crate for `core`" while building them.
+          if [ ! -d "$LOONGNIX_PREFIX/lib/rustlib/$LOONGNIX_TRIPLE" ] \
+             || [ ! -d "$LOONGNIX_PREFIX/lib/rustlib/x86_64-unknown-linux-gnu" ]; then
+            for component in \
+              "rustc-1.99.0-x86_64-unknown-linux-gnu.tar.xz" \
+              "rust-std-1.99.0-$LOONGNIX_TRIPLE.tar.xz" \
+              "rust-std-1.99.0-x86_64-unknown-linux-gnu.tar.xz"
+            do
+              echo "::group::install $component"
+              curl --proto '=https' --tlsv1.2 -sSfL --retry 5 --retry-delay 5 \
+                -o "$component" "$LOONGNIX_DIST/$component"
+              # Extract into a scratch dir so the cached `downloads` folder keeps only tarballs.
+              rm -rf scratch && mkdir scratch
+              tar xf "$component" -C scratch
+              ./scratch/"${component%.tar.xz}"/install.sh \
+                --prefix="$LOONGNIX_PREFIX" --without=rust-docs
+              rm -rf scratch
+              echo "::endgroup::"
+            done
+          else
+            echo "Rust toolchain already restored from cache"
+          fi
+
+          # --- GNU toolchain 8.3 (old-world linker + glibc 2.28 sysroot) -------------------
+          if [ ! -d "$TOOLCHAIN_ROOT/gcc8" ]; then
+            echo "::group::download Loongson GCC 8.3 cross toolchain"
+            curl --proto '=https' --tlsv1.2 -sSfL --retry 5 --retry-delay 5 \
+              -o gcc8.tar.xz "$GCC8_URL"
+            mkdir -p "$TOOLCHAIN_ROOT/gcc8"
+            tar xf gcc8.tar.xz -C "$TOOLCHAIN_ROOT/gcc8" --strip-components=1
+            echo "::endgroup::"
+          else
+            echo "GCC 8.3 toolchain already restored from cache"
+          fi
+
+          "$LOONGNIX_PREFIX/bin/rustc" -Vv
+          "$TOOLCHAIN_ROOT/gcc8/bin/loongarch64-linux-gnu-gcc" --version | head -1
+
+      - name: Configure the old-world toolchain
+        run: |
+          set -euo pipefail
+          GCC8="$TOOLCHAIN_ROOT/gcc8"
+          {
+            echo "RUSTC=$LOONGNIX_PREFIX/bin/rustc"
+            echo "GCC8=$GCC8"
+            echo "CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER=$GCC8/bin/loongarch64-linux-gnu-gcc"
+            # The C compiler for any crate with a build script that compiles C.
+            echo "CC_loongarch64_unknown_linux_gnu=$GCC8/bin/loongarch64-linux-gnu-gcc"
+            echo "AR_loongarch64_unknown_linux_gnu=$GCC8/bin/loongarch64-linux-gnu-ar"
+            echo "CXX_loongarch64_unknown_linux_gnu=$GCC8/bin/loongarch64-linux-gnu-g++"
+          } >> "$GITHUB_ENV"
+
+          # Loongson's cargo defaults to their crates mirror; the official cargo below uses
+          # crates.io, which carries every pinned version. Say so if that ever changes.
+          echo "RUSTC_BOOTSTRAP unset: this uses the stable-by-default Loongson channel."
+
+      - name: Record what is being built
+        run: |
+          set -euo pipefail
+          "$RUSTC" -Vv | sed 's/^/rustc: /'
+          "$GCC8/bin/loongarch64-linux-gnu-gcc" --version | head -1 | sed 's/^/gcc: /'
+          "$GCC8/bin/loongarch64-linux-gnu-ld" --version | head -1 | sed 's/^/ld: /'
+          # The sysroot's glibc version, from the runtime soname it ships (ld-2.28.so), which is
+          # what actually decides the ABI floor; features.h only carries the __GLIBC__ macro.
+          ls "$GCC8/loongarch64-linux-gnu/sysroot/usr/lib64/" 2>/dev/null \
+            | grep -oE '^(libc|ld)-[0-9]+\.[0-9]+\.so$' | sort -u | sed 's/^/sysroot: /' || true
+          git rev-parse HEAD | sed 's/^/commit: /'
+
+      - name: Build photocraft-cli
+        env:
+          PROFILE: ${{ inputs.profile }}
+          EXTRA_FEATURES: ${{ inputs.features }}
+        run: |
+          set -euo pipefail
+          args=(--target "$LOONGNIX_TRIPLE" -p photocraft-cli --bins)
+          if [ "$PROFILE" = "release" ]; then
+            args+=(--release)
+          fi
+          if [ -n "${EXTRA_FEATURES// /}" ]; then
+            args+=(--features "$EXTRA_FEATURES")
+          fi
+          echo "cargo build ${args[*]}"
+          # `--locked`: Cargo.lock is committed and must not drift. The Loongnix cargo's default
+          # mirror lacks some pinned versions, so this uses the ordinary cargo and crates.io.
+          cargo build --locked "${args[@]}"
+
+      - name: Verify the binary is really old world
+        if: ${{ inputs.verify_abi }}
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          if [ "$PROFILE" = "release" ]; then out_dir=release; else out_dir=debug; fi
+          bin="target/$LOONGNIX_TRIPLE/$out_dir/photocraft-cli"
+          test -x "$bin" || { echo "::error::missing $bin"; exit 1; }
+
+          echo "--- ELF header ---"
+          readelf -h "$bin" | grep -E 'Machine|Flags'
+          echo "--- program interpreter ---"
+          interp=$(readelf -l "$bin" | sed -n 's/.*interpreter: \(.*\)\]/\1/p')
+          echo "interpreter: $interp"
+          echo "--- GLIBC symbols required ---"
+          readelf --version-info "$bin" \
+            | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -uV | tee /tmp/glibc-versions.txt
+          echo "--- ELF ABI flags (raw e_flags) ---"
+          # Read e_flags out of the ELF header instead of trusting the human-readable names:
+          # record layouts differ between binutils versions. Old-world binutils 2.31 prints
+          # "LP64" where current binutils prints "OBJ-v0" / "OBJ-v1". The discriminator is the
+          # ABI-version field: bit 6 set means ABI v1 (new world), clear means v0 (old world).
+          # Measured on real artifacts: old world e_flags=0x3, new world e_flags=0x43.
+          abi_bits=$(
+            python3 - "$bin" <<'PY'
+          import struct, sys
+          with open(sys.argv[1], 'rb') as f:
+              ident = f.read(16)
+              if ident[:4] != b'\x7fELF' or ident[4] != 2 or ident[5] != 1:
+                  sys.exit(f"not a 64-bit little-endian ELF: {sys.argv[1]}")
+              # e_machine is at offset 18 (2 bytes), e_flags at offset 48 (4 bytes), ELF64.
+              f.seek(18)
+              machine = struct.unpack('<H', f.read(2))[0]
+              if machine != 258:
+                  sys.exit(f"e_machine is {machine}, expected 258 (EM_LOONGARCH)")
+              f.seek(48)
+              flags = struct.unpack('<I', f.read(4))[0]
+          print(f"{flags:#x} {(flags >> 6) & 0x3}")
+          PY
+          )
+          set -- $abi_bits
+          eflags="$1"
+          abi_version="$2"
+          echo "e_flags=$eflags (LoongArch ABI version = $abi_version)"
+
+          fail=0
+          # Old world: ld.so.1, not ld-linux-loongarch-lp64d.so.1.
+          if [ "$interp" != "/lib64/ld.so.1" ]; then
+            echo "::error::interpreter is '$interp', expected /lib64/ld.so.1 (old world)"
+            fail=1
+          fi
+          # LoongArch ABI version 0 is old world; 1 is new world.
+          if [ "$abi_version" != "0" ]; then
+            echo "::error::LoongArch ABI version is $abi_version, expected 0 (old world)"
+            fail=1
+          fi
+          # Nothing may require a glibc newer than the 2.28 old-world baseline.
+          newest=$(sort -V /tmp/glibc-versions.txt | tail -1)
+          echo "highest GLIBC symbol version: $newest"
+          if [ "$(printf '%s\nGLIBC_2.28\n' "$newest" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
+            echo "::error::binary needs $newest but old world provides only GLIBC_2.28"
+            fail=1
+          fi
+          # No unexpected host-library leakage (libstd's own deps are libc/pthread/dl/gcc_s).
+          if readelf -d "$bin" | grep -qE 'NEEDED.*(libcrypto|libssl|libstdc\+\+|libgomp)'; then
+            echo "::error::binary pulls in a C++/TLS host library"
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::the build is not a valid old-world LoongArch binary"
+            exit 1
+          fi
+          echo "::notice::verified old-world LoongArch64: $interp, ABI v$abi_version, max $newest"
+
+      - name: Strip and package
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          if [ "$PROFILE" = "release" ]; then out_dir=release; else out_dir=debug; fi
+          bin="target/$LOONGNIX_TRIPLE/$out_dir/photocraft-cli"
+          tarball="photocraft-cli-loongarch64-oldworld-$PROFILE.tar.xz"
+
+          mkdir -p dist
+          cp "$bin" dist/photocraft-cli
+          # Strip with Loongson's own strip: a host strip may not know EM_LOONGARCH (258) and
+          # could refuse or corrupt the file.
+          "$GCC8/bin/loongarch64-linux-gnu-strip" --strip-unneeded dist/photocraft-cli
+          ls -lh dist/photocraft-cli
+          tar -C dist -cJf "$tarball" photocraft-cli
+
+          sha256sum "$tarball" dist/photocraft-cli > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload the artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-cli-loongarch64-oldworld-${{ inputs.profile }}
+          path: |
+            photocraft-cli-loongarch64-oldworld-*.tar.xz
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Write a build summary
+        if: always()
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          {
+            echo "### LoongArch64 old world — photocraft-cli ($PROFILE)"
+            echo
+            if [ -f SHA256SUMS ]; then
+              echo '```'
+              cat SHA256SUMS
+              echo '```'
+            else
+              echo "_No artifact was produced._"
+            fi
+            echo
+            echo "Runs on Loongnix 20 / UOS V20 / Kylin V10 (vendor kernel 4.19, glibc 2.28)."
+            echo "QEMU cannot run this binary (it implements the new-world syscall ABI); test on real hardware."
+          } >> "$GITHUB_STEP_SUMMARY"
