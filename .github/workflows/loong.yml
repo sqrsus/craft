@@ -1,8 +1,8 @@
 # PhotoCraft on LoongArch64, "old world" (龙芯旧世界 / LoongArch ABI 1.0).
 #
-# Builds the headless `photocraft-cli` for old-world LoongArch: Loongnix 20, UOS V20, Kylin V10.
-# Those systems ship a vendor kernel 4.19 and glibc 2.28, and their ELF objects carry ABI flag
-# OBJ-v0 with the interpreter `/lib64/ld.so.1`.
+# Builds the desktop `photocraft` and the headless `photocraft-cli` for old-world LoongArch:
+# Loongnix 20, UOS V20, Kylin V10. Those systems ship a vendor kernel 4.19 and glibc 2.28, and
+# their ELF objects carry ABI flag OBJ-v0 with the interpreter `/lib64/ld.so.1`.
 #
 # Why the toolchain is not the ordinary one
 # -----------------------------------------
@@ -19,10 +19,8 @@
 # **x86_64 host** rustc plus the loongarch64 std, which is why a plain GitHub-hosted x86_64
 # runner can cross-compile for old world without a LoongArch machine.
 #
-# Verified on 2026-10-19 against rustc 1.99.0 (a4d5d3f0e 2026-10-09): the resulting
-# photocraft-cli has max GLIBC_2.28, INTERP /lib64/ld.so.1, LoongArch ABI version 0. The whole
-# CLI closure compiles unchanged for both the `dev` and `release` (thin LTO) profiles; the
-# workspace has no x86-only code on this path.
+# Verified on 2026-10-19 against rustc 1.99.0 (a4d5d3f0e 2026-10-09): the resulting binaries have
+# max GLIBC_2.28, INTERP /lib64/ld.so.1, LoongArch ABI version 0.
 #
 # The three moving parts, and why each is needed
 # ----------------------------------------------
@@ -38,16 +36,78 @@
 #    sysroot). Its ld emits the ABI-v0 flag and links against glibc 2.28; a modern Debian
 #    loong64 cross gcc links against glibc 2.41 and produces a new-world binary.
 #
+# What gets built, and why both binaries in one job
+# -------------------------------------------------
+# `packaging/linux/package.sh` ships `photocraft` and `photocraft-cli` together, built with
+# `--features heif`; this workflow produces the same pair, with the same feature set, in one
+# artifact whose layout matches that script (usr/bin plus usr/share/{applications,mime,metainfo,
+# icons,doc}), so the tarball can be unpacked over `/` on an old-world machine. One job rather
+# than two because both binaries share the whole dependency graph: two jobs would download the
+# ~200 MB toolchain twice, duplicate every step, and build the same 400+ crates twice for no
+# extra safety.
+#
+# The GUI's C dependencies: none at build time
+# --------------------------------------------
+# A cross-built GUI usually needs loongarch64 headers and `.so` files for its toolkit. This one
+# does not, and that is worth stating precisely, because it is the difference between "cross
+# compiles on any x86_64 runner" and "needs a target sysroot nobody has":
+#
+#   * eframe/egui on wgpu, with winit's x11 + wayland features. libX11 (`x11-dl`), libxkbcommon
+#     (`xkbcommon-dl`), libGL/libEGL/libvulkan (glutin, wgpu-hal, khronos-egl) are all opened with
+#     dlopen at run time.
+#   * `wayland-sys` is in the graph (wgpu-hal asks for its `client` and `egl` features), and
+#     without `dlopen` its build script runs pkg-config and emits `-lwayland-client`.
+#     `smithay-client-toolkit` -> `wayland-backend/dlopen` turns `wayland-sys/dlopen` on, and
+#     feature unification is global, so its build script is the empty `dlopen` branch. Measured
+#     on this tree with `cargo tree -e features -i wayland-sys`.
+#   * X11 goes through `x11rb` (pure Rust) in `photocraft-tablet` and in the drop-position code;
+#     `rfd` 0.17 is on xdg-portal (`zbus`, pure Rust), so there is no GTK in the closure at all.
+#   * The only `-sys` crates in the 418-crate GUI closure are `linux-raw-sys` (constants),
+#     `renderdoc-sys` (unused at run time) and `wayland-sys` (dlopen, as above).
+#
+# "Guard: the GUI links no C library at build time" asserts exactly this on every run. It fails
+# with an actionable message if a dependency change reintroduces a real link-time C dependency,
+# instead of letting the link step fail later with an unexplained "cannot find -lwayland-client".
+# A toolkit that genuinely needs target libraries (GTK, Qt, Tauri) would need a loongarch64
+# old-world sysroot published as a tarball and wired into this file.
+#
+# Caching
+# -------
+# Two caches, deliberately separate:
+#   * the extracted toolchains, under a key built from the pinned versions. Immutable: a hit is
+#     always valid, and a bump changes the key. The tarballs are not cached -- the extracted
+#     prefix is what gets reused, so caching both would double the entry for nothing.
+#   * CARGO_HOME's registry and git checkouts, keyed by Cargo.lock. This one must be *mutable*:
+#     a fixed key would freeze the crates.io index and the `craft-libs` checkouts at whatever the
+#     first run saw, and every later run would re-download the difference.
+# `target/` is not cached: a release target dir for this workspace is several GB and the repo's
+# 10 GB cache budget is already contended (see the notes in ci.yml). `inputs.fast` is the cheaper
+# lever -- it drops thin LTO and single-codegen-unit, exactly what ci.yml's corpus job does.
+#
 # Testing
 # -------
 # The build is verified structurally (ELF interpreter, ABI flags, and the highest GLIBC symbol
 # version, all asserted below), not by executing the binary: QEMU's linux-user mode implements
 # the *upstream* LoongArch syscall ABI, so old-world binaries abort under it (their 16-byte
 # sigset in rt_sigaction is rejected with EINVAL by a kernel expecting the new layout). Run the
-# artifact on a real old-world machine, or in an old-world container/VM.
+# artifact on a real old-world machine, or in an old-world container/VM. `verify_abi: false`
+# never skips the checks: it downgrades failures to warnings and labels the artifact
+# `-unverified`, so an unchecked build cannot be mistaken for a checked one.
 name: LoongArch old world
 
 on:
+  # Dependency-level drift is what breaks a cross build: a new crate that links a C library, a
+  # lockfile bump that pulls one in. Watch the files that can cause it, not every source change,
+  # so this stays a cheap check on main instead of a 30-minute tax on every merge.
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/loong.yml
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain
+      - rust-toolchain.toml
+      - '**/build.rs'
   workflow_dispatch:
     inputs:
       project_path:
@@ -59,16 +119,28 @@ on:
         options: [release, dev]
         default: release
       features:
-        description: "Extra cargo features (blank = none; official builds use `heif`)"
+        description: "Cargo features (blank = `heif`, the set official builds use)"
         default: ""
+      fast:
+        description: "Skip thin LTO / single codegen unit for a quick check (artifact is labelled -fast)"
+        type: boolean
+        default: false
       verify_abi:
-        description: "Fail if the binary is not a valid old-world ELF"
+        description: "Treat ABI failures as errors (false: warn and label the artifact -unverified)"
         type: boolean
         default: true
+      require_toolchain_pins:
+        description: "Fail if a toolchain tarball has no sha256 pin yet"
+        type: boolean
+        default: false
 
 concurrency:
   group: loongarch-oldworld-${{ github.ref }}
-  cancel-in-progress: true
+  # Same rule as ci.yml: a manual run supersedes the previous one, but a run on main is never
+  # cancelled by a later push. Cancelling those left commits on main with no old-world verdict
+  # whenever two merges landed close together, which is exactly the drift this job exists to
+  # catch.
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 permissions:
   contents: read
@@ -77,12 +149,15 @@ env:
   CARGO_TERM_COLOR: always
   # Rust and cargo spend a lot of RAM on a cold build of ~500 crates; keep jobs predictable.
   CARGO_NET_RETRY: "5"
+  # No incremental artefacts: they only inflate the target dir on a runner that starts cold.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   build:
-    name: photocraft-cli (loongarch64 old world)
-    # A cold build of the CLI closure measured ~25 min on a 6-core x86_64 host; keep headroom.
-    timeout-minutes: 180
+    name: photocraft + photocraft-cli (loongarch64 old world)
+    # A cold build of the CLI closure measured ~25 min on a 6-core x86_64 host; the GUI adds the
+    # wgpu stack on top. Keep headroom for a cold cache plus thin LTO on a 4-core runner.
+    timeout-minutes: 240
     runs-on: ubuntu-24.04
 
     env:
@@ -95,6 +170,16 @@ jobs:
       TOOLCHAIN_ROOT: ${{ github.workspace }}/.loongarch
       LOONGNIX_PREFIX: ${{ github.workspace }}/.loongarch/rust
       CARGO_HOME: ${{ github.workspace }}/.loongarch/cargo
+      # sha256 pins for the four downloaded tarballs. Empty means "not pinned yet": the fetch
+      # step then prints the hash it saw as a warning, so the first run bootstraps the values
+      # that belong here. `require_toolchain_pins` turns that warning into a failure, which is
+      # what a hardened setup should run with.
+      RUSTC_SHA256: ""
+      RUST_STD_TARGET_SHA256: ""
+      RUST_STD_HOST_SHA256: ""
+      GCC8_SHA256: ""
+      # Every package this workflow ships. The artifact lists them in this order.
+      BINARIES: photocraft photocraft-cli
 
     steps:
       - name: Check out
@@ -102,8 +187,8 @@ jobs:
 
       # The repository that runs this workflow is not necessarily the PhotoCraft workspace root:
       # it may be a monorepo (the SAME repo can hold several craft apps) with PhotoCraft in a
-      # subdirectory. Every later step needs the checkout root for tools/caches and the workspace
-      # root for cargo, so resolve both here and publish them for the rest of the job.
+      # subdirectory. Every later step needs the checkout root for caches and the workspace root
+      # for cargo, so resolve both here and publish them for the rest of the job.
       - name: Locate the PhotoCraft workspace
         env:
           INPUT_PATH: ${{ inputs.project_path }}
@@ -151,33 +236,92 @@ jobs:
             echo "CHECKOUT_ROOT=$checkout"
           } >> "$GITHUB_ENV"
 
-          # Prove the package we intend to build really is in this workspace.
-          grep -nE 'name *= *"photocraft-cli"' "$root"/apps/photocraft-cli/Cargo.toml
+          # Prove both packages we intend to build really are in this workspace, and take the
+          # version from the manifest rather than from a tag: the artifact is named after what
+          # cargo actually built.
+          for pkg in photocraft-cli photocraft; do
+            grep -nE "name *= *\"$pkg\"" "$root/apps/$pkg/Cargo.toml"
+          done
+          cd "$root"
+          cat > /tmp/pkg-version.py <<'PY'
+          import json, sys
+          data = json.load(sys.stdin)
+          for pkg in data["packages"]:
+              if pkg["name"] == sys.argv[1]:
+                  print(pkg["version"])
+                  break
+          else:
+              sys.exit(2)
+          PY
+          version=$(cargo metadata --format-version 1 --no-deps | python3 /tmp/pkg-version.py photocraft)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "::notice::PhotoCraft $version"
 
-      - name: Check the host toolchain has an ordinary cargo
+      - name: Check the host tools
         run: |
+          set -euo pipefail
           # GitHub's ubuntu images ship rustup + a stable cargo. We only need `cargo` from it:
           # the compiler and std are Loongson's (see the header), selected through RUSTC.
+          # python3 reads the ELF header in the ABI check; sha256sum verifies the toolchains.
           command -v cargo >/dev/null || { echo "::error::no cargo on the runner"; exit 1; }
+          command -v python3 >/dev/null || { echo "::error::no python3 on the runner"; exit 1; }
+          command -v sha256sum >/dev/null || { echo "::error::no sha256sum on the runner"; exit 1; }
           cargo -V
+          python3 -V
 
-      - name: Cache the LoongArch toolchains and cargo registry
+      - name: Cache the extracted toolchains
         uses: actions/cache@v4
         with:
           path: |
             .loongarch/gcc8
             .loongarch/rust
-            .loongarch/cargo
-            .loongarch/downloads
-          # The toolchain URLs are pinned in `env`, but a cache key cannot read `env`, so the
-          # same version strings are repeated here. Keep the two in sync when bumping.
-          key: loongnix-abi1.0-rust1.99.0-20261009-gcc8rc1.6-v1
+          # A cache key cannot read `env`, so the pinned versions are repeated here. Keep the two
+          # in sync when bumping; the key is immutable on purpose (a hit is always the exact
+          # toolchain named above).
+          key: loongnix-abi1.0-rust-1.99.0-20261009-gcc8-rc1.6
 
-      - name: Fetch Loongson's old-world Rust and GCC 8.3 toolchains
+      - name: Cache the cargo registry and git checkouts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .loongarch/cargo/registry
+            .loongarch/cargo/git
+          # Mutable by design: the primary key follows Cargo.lock, so the index and the
+          # `craft-libs` checkouts are refreshed whenever dependencies change, and the
+          # restore-key prefix keeps a warm baseline for the runs in between. A single fixed key
+          # would pin both to the first run's state and re-download everything added since.
+          key: loongarch-cargo-${{ hashFiles('**/Cargo.lock', '**/.cargo/config.toml') }}
+          restore-keys: |
+            loongarch-cargo-
+
+      - name: Fetch and verify Loongson's old-world toolchains
+        env:
+          REQUIRE_PINS: ${{ inputs.require_toolchain_pins }}
         run: |
           set -euo pipefail
           mkdir -p "$TOOLCHAIN_ROOT/downloads"
           cd "$TOOLCHAIN_ROOT/downloads"
+
+          # Verify a tarball against its pin. An empty pin is a *warning*, not a pass: it prints
+          # the hash so the value can be pasted into `env`, and the run after that is enforced.
+          # Nothing is silently trusted -- the repo verifies its other downloads the same way
+          # (packaging/linux/verified-download.sh, xtask/src/sha256.rs, the corpus pins).
+          verify_sha() {
+            file=$1; want=$2; var=$3
+            got=$(sha256sum "$file" | cut -d' ' -f1)
+            if [ -n "$want" ]; then
+              if [ "$got" != "$want" ]; then
+                echo "::error::$file sha256 mismatch: pinned $want, downloaded $got"
+                exit 1
+              fi
+              echo "sha256 ok: $file"
+            elif [ "${REQUIRE_PINS:-false}" = "true" ]; then
+              echo "::error::$file is not pinned. Set $var=$got in the job env."
+              exit 1
+            else
+              echo "::warning::$file is not pinned yet -- add $var=$got to the job env."
+            fi
+          }
 
           # --- Rust (ABI 1.0) -------------------------------------------------------------
           # rustc for the x86_64 host, plus rust-std for BOTH the loongarch64 target and the
@@ -185,15 +329,20 @@ jobs:
           # std alone gives "can't find crate for `core`" while building them.
           if [ ! -d "$LOONGNIX_PREFIX/lib/rustlib/$LOONGNIX_TRIPLE" ] \
              || [ ! -d "$LOONGNIX_PREFIX/lib/rustlib/x86_64-unknown-linux-gnu" ]; then
-            for component in \
-              "rustc-1.99.0-x86_64-unknown-linux-gnu.tar.xz" \
-              "rust-std-1.99.0-$LOONGNIX_TRIPLE.tar.xz" \
+            components=(
+              "rustc-1.99.0-x86_64-unknown-linux-gnu.tar.xz"
+              "rust-std-1.99.0-$LOONGNIX_TRIPLE.tar.xz"
               "rust-std-1.99.0-x86_64-unknown-linux-gnu.tar.xz"
-            do
+            )
+            pins=("$RUSTC_SHA256" "$RUST_STD_TARGET_SHA256" "$RUST_STD_HOST_SHA256")
+            vars=(RUSTC_SHA256 RUST_STD_TARGET_SHA256 RUST_STD_HOST_SHA256)
+            for i in "${!components[@]}"; do
+              component="${components[$i]}"
               echo "::group::install $component"
               curl --proto '=https' --tlsv1.2 -sSfL --retry 5 --retry-delay 5 \
                 -o "$component" "$LOONGNIX_DIST/$component"
-              # Extract into a scratch dir so the cached `downloads` folder keeps only tarballs.
+              verify_sha "$component" "${pins[$i]}" "${vars[$i]}"
+              # Extract into a scratch dir so the job's `downloads` dir keeps only tarballs.
               rm -rf scratch && mkdir scratch
               tar xf "$component" -C scratch
               ./scratch/"${component%.tar.xz}"/install.sh \
@@ -202,7 +351,7 @@ jobs:
               echo "::endgroup::"
             done
           else
-            echo "Rust toolchain already restored from cache"
+            echo "Rust toolchain already restored from cache (tarballs not re-verified)"
           fi
 
           # --- GNU toolchain 8.3 (old-world linker + glibc 2.28 sysroot) -------------------
@@ -210,20 +359,50 @@ jobs:
             echo "::group::download Loongson GCC 8.3 cross toolchain"
             curl --proto '=https' --tlsv1.2 -sSfL --retry 5 --retry-delay 5 \
               -o gcc8.tar.xz "$GCC8_URL"
+            verify_sha gcc8.tar.xz "$GCC8_SHA256" GCC8_SHA256
             mkdir -p "$TOOLCHAIN_ROOT/gcc8"
             tar xf gcc8.tar.xz -C "$TOOLCHAIN_ROOT/gcc8" --strip-components=1
             echo "::endgroup::"
           else
-            echo "GCC 8.3 toolchain already restored from cache"
+            echo "GCC 8.3 toolchain already restored from cache (tarball not re-verified)"
           fi
 
           "$LOONGNIX_PREFIX/bin/rustc" -Vv
           "$TOOLCHAIN_ROOT/gcc8/bin/loongarch64-linux-gnu-gcc" --version | head -1
 
-      - name: Configure the old-world toolchain
+      # Every knob is normalised here, once, into a BUILD_* variable the later steps read. A
+      # `push` run has no `inputs` context at all, so `inputs.profile` is empty there: reading
+      # the raw input downstream would silently build a debug binary and downgrade the ABI
+      # check. One place decides, and the decision is visible in the log.
+      - name: Normalise the build settings and configure the old-world toolchain
+        env:
+          INPUT_PROFILE: ${{ inputs.profile }}
+          INPUT_FEATURES: ${{ inputs.features }}
+          INPUT_FAST: ${{ inputs.fast }}
+          INPUT_VERIFY_ABI: ${{ inputs.verify_abi }}
         run: |
           set -euo pipefail
           GCC8="$TOOLCHAIN_ROOT/gcc8"
+
+          profile="${INPUT_PROFILE:-release}"
+          case "$profile" in
+            release|dev) ;;
+            *) echo "::error::unknown profile '$profile'"; exit 1 ;;
+          esac
+
+          # `heif` is what official builds use (packaging/linux/package.sh, ci.yml); an empty
+          # input must not silently ship a build that cannot open HEIC photos.
+          features="$INPUT_FEATURES"
+          if [ -z "${features// /}" ]; then
+            features=heif
+          fi
+
+          # Absent input means "on", except for `fast`, which is opt-in.
+          strict=true
+          if [ "${INPUT_VERIFY_ABI:-}" = "false" ]; then strict=false; fi
+          fast=false
+          if [ "${INPUT_FAST:-}" = "true" ] && [ "$profile" = "release" ]; then fast=true; fi
+
           {
             echo "RUSTC=$LOONGNIX_PREFIX/bin/rustc"
             echo "GCC8=$GCC8"
@@ -232,11 +411,97 @@ jobs:
             echo "CC_loongarch64_unknown_linux_gnu=$GCC8/bin/loongarch64-linux-gnu-gcc"
             echo "AR_loongarch64_unknown_linux_gnu=$GCC8/bin/loongarch64-linux-gnu-ar"
             echo "CXX_loongarch64_unknown_linux_gnu=$GCC8/bin/loongarch64-linux-gnu-g++"
+            echo "BUILD_PROFILE=$profile"
+            echo "BUILD_FEATURES=$features"
+            echo "ABI_STRICT=$strict"
+            echo "FAST_BUILD=$fast"
+            # Provenance is read at compile time by crates/engine/src/build_info.rs
+            # (`option_env!`), so About and `--version` in the shipped binaries name the commit
+            # they came from instead of reporting a dev build.
+            echo "PHOTOCRAFT_BUILD_SHA=$(git rev-parse HEAD)"
+            echo "PHOTOCRAFT_BUILD_DATE=$(date -u +%F)"
           } >> "$GITHUB_ENV"
 
+          # `fast` trades the release profile's thin LTO and single codegen unit for build speed.
+          # Same trick as ci.yml's corpus job, for the same reason: the code under test is
+          # identical, only the artifact is bigger and slower, so it is labelled `-fast`.
+          if [ "$fast" = "true" ]; then
+            {
+              echo "CARGO_PROFILE_RELEASE_LTO=false"
+              echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
+            } >> "$GITHUB_ENV"
+            echo "::warning::fast=true: thin LTO and codegen-units=1 are off, the artifact is not shippable"
+          fi
+
+          echo "profile: $profile, features: $features, ABI strict: $strict, fast: $fast"
           # Loongson's cargo defaults to their crates mirror; the official cargo below uses
           # crates.io, which carries every pinned version. Say so if that ever changes.
           echo "RUSTC_BOOTSTRAP unset: this uses the stable-by-default Loongson channel."
+
+      # The GUI is only cross-buildable because nothing in its closure asks for a loongarch64 C
+      # library (see the header). That is a property of the dependency graph, not of this
+      # workflow, so it is asserted rather than assumed: a new crate that links GTK, Qt, libudev
+      # or an un-dlopened libwayland must fail here, with the reason, instead of failing in the
+      # link step with "cannot find -lwayland-client".
+      - name: "Guard: the GUI links no C library at build time"
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          cargo tree -p photocraft -e normal,build --target "$LOONGNIX_TRIPLE" --prefix none \
+            --locked > /tmp/gui-closure.txt
+          deps=$(awk 'NF {print $1}' /tmp/gui-closure.txt | sort -u)
+          echo "GUI closure: $(printf '%s\n' "$deps" | wc -l) distinct crates"
+
+          fail=0
+
+          # 1. No crate that would make pkg-config produce -I/-L flags for a target library.
+          linkers='gtk|gdk|gtk4|gdk4|glib-sys|gobject-sys|gio-sys|pango-sys|atk-sys|cairo-sys-rs|gdk-pixbuf-sys|webkit2gtk|webkit2gtk-sys|soup2-sys|soup3-sys|javascriptcore-rs|libappindicator-sys|openssl-sys|libudev-sys|alsa-sys|libpulse-sys|libsqlite3-sys|freetype-sys|fontconfig-sys|expat-sys|libz-sys|zstd-sys|libxcb|libxdo-sys'
+          hits=$(printf '%s\n' "$deps" | grep -xE "($linkers)" || true)
+          if [ -n "$hits" ]; then
+            echo "::error::the GUI now depends on a crate that links a C library for the target:"
+            echo "$hits" | sed 's/^/  /'
+            echo "::error::this build has no loongarch64 old-world headers or .so files. Either turn"
+            echo "::error::that feature off, or add a target sysroot (a tarball holding usr/include,"
+            echo "::error::usr/lib and usr/lib*/pkgconfig from a Loongnix 20 / UOS V20 machine) and"
+            echo "::error::point PKG_CONFIG_LIBDIR, CFLAGS and LDFLAGS at it in this workflow."
+            fail=1
+          fi
+
+          # 2. `-sys` crates are only acceptable when they never link: constants-only, unused, or
+          #    dlopen. Anything new here is a pkg-config probe waiting to happen.
+          allowed='linux-raw-sys|renderdoc-sys|wayland-sys'
+          unexpected=$(printf '%s\n' "$deps" | grep -E -- '-sys$' | grep -vxE "($allowed)" || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::unexpected -sys crates in the GUI closure:"
+            echo "$unexpected" | sed 's/^/  /'
+            echo "::error::add each one to the allowlist above only after checking that its build"
+            echo "::error::script does not run pkg-config or emit -l flags for the target."
+            fail=1
+          fi
+
+          # 3. wayland-sys is expected, in dlopen mode. Its `client`/`egl` features come from
+          #    wgpu-hal; `dlopen` comes from smithay-client-toolkit and unifies across the build,
+          #    which is what turns its build script into a no-op. Without it the crate links
+          #    libwayland-client, and the link step needs a target .so this runner does not have.
+          if printf '%s\n' "$deps" | grep -qx wayland-sys; then
+            if ! cargo tree -e features -i wayland-sys --target "$LOONGNIX_TRIPLE" 2>/dev/null \
+                 | grep -q 'wayland-sys feature "dlopen"'; then
+              echo "::error::wayland-sys is in the closure but not in dlopen mode: its build script"
+              echo "::error::will run pkg-config and emit -lwayland-client, and this runner has no"
+              echo "::error::loongarch64 copy of that library. Find what dropped the dlopen feature."
+              fail=1
+            else
+              echo "wayland-sys: dlopen (no link flag, no pkg-config probe)"
+            fi
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::the GUI's build-time C surface is no longer empty"
+            exit 1
+          fi
+          echo "LINK_GUARD=clean" >> "$GITHUB_ENV"
+          echo "::notice::GUI build-time C surface: none (every C library is dlopen at run time)"
 
       - name: Record what is being built
         run: |
@@ -248,21 +513,22 @@ jobs:
           # what actually decides the ABI floor; features.h only carries the __GLIBC__ macro.
           ls "$GCC8/loongarch64-linux-gnu/sysroot/usr/lib64/" 2>/dev/null \
             | grep -oE '^(libc|ld)-[0-9]+\.[0-9]+\.so$' | sort -u | sed 's/^/sysroot: /' || true
+          echo "packages: $BINARIES"
+          echo "features: $BUILD_FEATURES"
+          echo "link guard: ${LINK_GUARD:-not run}"
           git rev-parse HEAD | sed 's/^/commit: /'
 
-      - name: Build photocraft-cli
-        env:
-          PROFILE: ${{ inputs.profile }}
-          EXTRA_FEATURES: ${{ inputs.features }}
+      - name: Build photocraft-cli and photocraft
         run: |
           set -euo pipefail
           cd "$PROJECT_ROOT"
-          args=(--target "$LOONGNIX_TRIPLE" -p photocraft-cli --bins)
-          if [ "$PROFILE" = "release" ]; then
+          # Same selection as packaging/linux/package.sh: both binaries, one feature set, so the
+          # dependency graph is built once and the artifact matches what the Linux package ships.
+          args=(--target "$LOONGNIX_TRIPLE")
+          for pkg in $BINARIES; do args+=(-p "$pkg"); done
+          args+=(--bins --features "$BUILD_FEATURES")
+          if [ "$BUILD_PROFILE" = "release" ]; then
             args+=(--release)
-          fi
-          if [ -n "${EXTRA_FEATURES// /}" ]; then
-            args+=(--features "$EXTRA_FEATURES")
           fi
           echo "workspace: $PROJECT_ROOT"
           echo "cargo build ${args[*]}"
@@ -272,33 +538,18 @@ jobs:
           # mirror lacks some pinned versions, so this uses the ordinary cargo and crates.io.
           cargo build --locked "${args[@]}"
 
-      - name: Verify the binary is really old world
-        if: ${{ inputs.verify_abi }}
-        env:
-          PROFILE: ${{ inputs.profile }}
+      - name: Verify both binaries are old world
         run: |
           set -euo pipefail
           cd "$PROJECT_ROOT"
-          if [ "$PROFILE" = "release" ]; then out_dir=release; else out_dir=debug; fi
-          bin="target/$LOONGNIX_TRIPLE/$out_dir/photocraft-cli"
-          test -x "$bin" || { echo "::error::missing $bin (cwd: $(pwd))"; exit 1; }
+          if [ "$BUILD_PROFILE" = "release" ]; then out_dir=release; else out_dir=debug; fi
 
-          echo "--- ELF header ---"
-          readelf -h "$bin" | grep -E 'Machine|Flags'
-          echo "--- program interpreter ---"
-          interp=$(readelf -l "$bin" | sed -n 's/.*interpreter: \(.*\)\]/\1/p')
-          echo "interpreter: $interp"
-          echo "--- GLIBC symbols required ---"
-          readelf --version-info "$bin" \
-            | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -uV | tee /tmp/glibc-versions.txt
-          echo "--- ELF ABI flags (raw e_flags) ---"
           # Read e_flags out of the ELF header instead of trusting the human-readable names:
           # record layouts differ between binutils versions. Old-world binutils 2.31 prints
           # "LP64" where current binutils prints "OBJ-v0" / "OBJ-v1". The discriminator is the
           # ABI-version field: bit 6 set means ABI v1 (new world), clear means v0 (old world).
           # Measured on real artifacts: old world e_flags=0x3, new world e_flags=0x43.
-          abi_bits=$(
-            python3 - "$bin" <<'PY'
+          cat > /tmp/loongarch-eflags.py <<'PY'
           import struct, sys
           with open(sys.argv[1], 'rb') as f:
               ident = f.read(16)
@@ -313,90 +564,214 @@ jobs:
               flags = struct.unpack('<I', f.read(4))[0]
           print(f"{flags:#x} {(flags >> 6) & 0x3}")
           PY
-          )
-          set -- $abi_bits
-          eflags="$1"
-          abi_version="$2"
-          echo "e_flags=$eflags (LoongArch ABI version = $abi_version)"
 
+          report=/tmp/abi-report.txt
+          : > "$report"
+          : > /tmp/glibc-versions.txt
           fail=0
-          # Old world: ld.so.1, not ld-linux-loongarch-lp64d.so.1.
-          if [ "$interp" != "/lib64/ld.so.1" ]; then
-            echo "::error::interpreter is '$interp', expected /lib64/ld.so.1 (old world)"
-            fail=1
-          fi
-          # LoongArch ABI version 0 is old world; 1 is new world.
-          if [ "$abi_version" != "0" ]; then
-            echo "::error::LoongArch ABI version is $abi_version, expected 0 (old world)"
-            fail=1
-          fi
-          # Nothing may require a glibc newer than the 2.28 old-world baseline.
-          newest=$(sort -V /tmp/glibc-versions.txt | tail -1)
-          echo "highest GLIBC symbol version: $newest"
-          if [ "$(printf '%s\nGLIBC_2.28\n' "$newest" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
-            echo "::error::binary needs $newest but old world provides only GLIBC_2.28"
-            fail=1
-          fi
-          # No unexpected host-library leakage (libstd's own deps are libc/pthread/dl/gcc_s).
-          if readelf -d "$bin" | grep -qE 'NEEDED.*(libcrypto|libssl|libstdc\+\+|libgomp)'; then
-            echo "::error::binary pulls in a C++/TLS host library"
-            fail=1
-          fi
-          if [ "$fail" -ne 0 ]; then
-            echo "::error::the build is not a valid old-world LoongArch binary"
-            exit 1
-          fi
-          echo "::notice::verified old-world LoongArch64: $interp, ABI v$abi_version, max $newest"
 
-      - name: Strip and package
-        env:
-          PROFILE: ${{ inputs.profile }}
+          for name in $BINARIES; do
+            bin="target/$LOONGNIX_TRIPLE/$out_dir/$name"
+            echo "=== $name ==="
+            if [ ! -x "$bin" ]; then
+              echo "::error::missing $bin (cwd: $(pwd))"
+              fail=1
+              continue
+            fi
+
+            echo "--- ELF header ---"
+            readelf -h "$bin" | grep -E 'Machine|Flags'
+            echo "--- program interpreter ---"
+            interp=$(readelf -l "$bin" | sed -n 's/.*interpreter: \(.*\)\]/\1/p')
+            echo "interpreter: $interp"
+            echo "--- GLIBC symbols required ---"
+            # A binary with no versioned symbols is not a failure here: the interpreter and the
+            # ABI flag still decide. Without the `|| true`, pipefail would fail the whole step on
+            # an empty grep and report a mismatch that never happened.
+            { readelf --version-info "$bin" \
+                | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -uV | tee -a /tmp/glibc-versions.txt; } || true
+            echo "--- ELF ABI flags (raw e_flags) ---"
+            if ! abi_bits=$(python3 /tmp/loongarch-eflags.py "$bin"); then
+              echo "::error::$name: cannot read the ELF header (see the parser error above)"
+              fail=1
+              continue
+            fi
+            set -- $abi_bits
+            eflags="$1"
+            abi_version="$2"
+            echo "e_flags=$eflags (LoongArch ABI version = $abi_version)"
+            echo "--- dynamic dependencies ---"
+            readelf -d "$bin" | sed -n 's/.*NEEDED.*\[\(.*\)\]/  \1/p'
+
+            # Old world: ld.so.1, not ld-linux-loongarch-lp64d.so.1.
+            if [ "$interp" != "/lib64/ld.so.1" ]; then
+              echo "::error::$name: interpreter is '${interp:-none}', expected /lib64/ld.so.1 (old world)"
+              fail=1
+            fi
+            # LoongArch ABI version 0 is old world; 1 is new world.
+            if [ "$abi_version" != "0" ]; then
+              echo "::error::$name: LoongArch ABI version is $abi_version, expected 0 (old world)"
+              fail=1
+            fi
+            # No host-library leakage. The GUI closure has no C++ dependency at all (see the link
+            # guard), so a C++ or TLS runtime here means the build picked up a host library.
+            if readelf -d "$bin" | grep -qE 'NEEDED.*(libcrypto|libssl|libstdc\+\+|libgomp)'; then
+              echo "::error::$name: pulls in a C++/TLS runtime that is not part of this closure"
+              fail=1
+            fi
+            {
+              echo "## $name"
+              echo "- interpreter: \`${interp:-none}\`"
+              echo "- e_flags: \`$eflags\` (LoongArch ABI version $abi_version)"
+            } >> "$report"
+          done
+
+          # Nothing may require a glibc newer than the 2.28 old-world baseline, across both bins.
+          newest=$(sort -V /tmp/glibc-versions.txt | tail -1)
+          echo "highest GLIBC symbol version: ${newest:-none}"
+          echo "- highest GLIBC symbol version: \`${newest:-none}\` (baseline: 2.28)" >> "$report"
+          if [ "$(printf '%s\nGLIBC_2.28\n' "$newest" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
+            echo "::error::a binary needs ${newest:-nothing} but old world provides only GLIBC_2.28"
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            if [ "$ABI_STRICT" = "true" ]; then
+              echo "::error::the build is not a valid old-world LoongArch artifact"
+              exit 1
+            fi
+            # Downgraded, not skipped: the artifact is labelled so it cannot pass for a checked one.
+            echo "::warning::ABI check failed and verify_abi=false: shipping an unverified artifact"
+            echo "UNVERIFIED=1" >> "$GITHUB_ENV"
+            echo "- **UNVERIFIED**: the ABI checks above failed (see the annotations)" >> "$report"
+          else
+            echo "::notice::verified old-world LoongArch64: /lib64/ld.so.1, ABI v0, max ${newest:-none}"
+          fi
+
+      - name: Stage, strip and package
         run: |
           set -euo pipefail
           cd "$PROJECT_ROOT"
-          if [ "$PROFILE" = "release" ]; then out_dir=release; else out_dir=debug; fi
-          bin="target/$LOONGNIX_TRIPLE/$out_dir/photocraft-cli"
-          tarball="photocraft-cli-loongarch64-oldworld-$PROFILE.tar.xz"
+          if [ "$BUILD_PROFILE" = "release" ]; then out_dir=release; else out_dir=debug; fi
 
-          # Package under the checkout root, not the workspace root: the upload-artifact step
-          # resolves `path` relative to the checkout, and this keeps both in step no matter
-          # where PhotoCraft lives in the repository.
-          out="$CHECKOUT_ROOT/dist"
-          rm -rf "$out"
-          mkdir -p "$out"
-          cp "$bin" "$out/photocraft-cli"
-          # Strip with Loongson's own strip: a host strip may not know EM_LOONGARCH (258) and
-          # could refuse or corrupt the file.
-          "$GCC8/bin/loongarch64-linux-gnu-strip" --strip-unneeded "$out/photocraft-cli"
-          ls -lh "$out/photocraft-cli"
-          # Build the archive from inside dist/ so it holds a bare `photocraft-cli` entry.
-          pushd "$out" >/dev/null
-          rm -f "$tarball" SHA256SUMS
-          tar -cJf "$tarball" photocraft-cli
+          # Same shape as packaging/linux/package.sh: an FHS tree that can be unpacked over `/`,
+          # named after the version cargo built. The suffix says what the artifact is: a `dev`
+          # build, a `-fast` build with LTO off, and/or one that failed its ABI checks.
+          suffix="-oldworld"
+          [ "$BUILD_PROFILE" = "release" ] || suffix="$suffix-$BUILD_PROFILE"
+          [ "$FAST_BUILD" != "true" ] || suffix="$suffix-fast"
+          [ "${UNVERIFIED:-0}" != "1" ] || suffix="$suffix-unverified"
+          base="photocraft-$VERSION-linux-loongarch64$suffix"
+          tarball="$base.tar.xz"
 
-          sha256sum "$tarball" photocraft-cli > SHA256SUMS
+          work="$CHECKOUT_ROOT/dist"
+          stage="$work/$base"
+          rm -rf "$work"
+          mkdir -p "$stage/usr/bin" "$stage/usr/share/doc/photocraft"
+
+          for name in $BINARIES; do
+            cp "target/$LOONGNIX_TRIPLE/$out_dir/$name" "$stage/usr/bin/$name"
+            # Strip with Loongson's own strip: a host strip may not know EM_LOONGARCH (258) and
+            # could refuse or corrupt the file. package.sh does the same through CROSS_COMPILE.
+            "$GCC8/bin/loongarch64-linux-gnu-strip" --strip-unneeded "$stage/usr/bin/$name"
+            ls -lh "$stage/usr/bin/$name"
+          done
+
+          # Desktop integration, taken from packaging/linux so a LoongArch install looks like any
+          # other Linux install.
+          app_id=ai.storyteller.photocraft
+          install -Dm644 "packaging/linux/$app_id.desktop" \
+            "$stage/usr/share/applications/$app_id.desktop"
+          install -Dm644 "packaging/linux/$app_id.mime.xml" \
+            "$stage/usr/share/mime/packages/$app_id.xml"
+          mkdir -p "$stage/usr/share/metainfo"
+          sed -e "s/@VERSION@/$VERSION/g" -e "s/@DATE@/${PHOTOCRAFT_BUILD_DATE:-unknown}/g" \
+            "packaging/linux/$app_id.metainfo.xml.in" \
+            > "$stage/usr/share/metainfo/$app_id.metainfo.xml"
+          # `cp -R src dir/` needs dir to exist, hence the mkdir (package.sh does the same).
+          mkdir -p "$stage/usr/share/icons"
+          cp -R assets/app-icon/hicolor "$stage/usr/share/icons/"
+
+          # Apache-2.0 and MIT both require the licence text to travel with the binaries.
+          for doc in LICENSE-MIT LICENSE-APACHE NOTICE ATTRIBUTION.md; do
+            if [ -f "$doc" ]; then
+              install -Dm644 "$doc" "$stage/usr/share/doc/photocraft/$doc"
+            fi
+          done
+
+          # What a real machine must provide, and how these binaries were produced. CI cannot run
+          # the artifact (no emulator for this ABI, and no display for the GUI), so this is the
+          # contract handed to whoever deploys it.
+          {
+            echo "# Runtime sonames required by these binaries."
+            echo "# All must exist on the target Loongnix 20 / UOS V20 / Kylin V10 machine."
+            echo "# Inspect with: readelf -d <binary> | grep NEEDED"
+            for name in $BINARIES; do
+              echo "== $name"
+              readelf -d "$stage/usr/bin/$name" | sed -n 's/.*NEEDED.*\[\(.*\)\]/  \1/p'
+            done
+          } > "$stage/usr/share/doc/photocraft/RUNTIME-LIBS.txt"
+
+          # Informational only: a missing or renamed toolchain binary must not throw away a
+          # finished build this late in the job.
+          abi_state=verified
+          if [ "${UNVERIFIED:-0}" = "1" ]; then abi_state=unverified; fi
+          {
+            echo "PhotoCraft $VERSION for Linux loongarch64 (old world, LoongArch ABI 1.0)"
+            echo "commit: ${PHOTOCRAFT_BUILD_SHA:-unknown}"
+            echo "date: ${PHOTOCRAFT_BUILD_DATE:-unknown}"
+            echo "profile: $BUILD_PROFILE"
+            echo "features: $BUILD_FEATURES"
+            echo "fast build (LTO off): $FAST_BUILD"
+            echo "link guard: ${LINK_GUARD:-not run}"
+            echo "abi: $abi_state"
+            echo
+            "$RUSTC" -Vv 2>/dev/null || echo "rustc: unknown"
+            { "$GCC8/bin/loongarch64-linux-gnu-ld" --version 2>/dev/null | head -1; } \
+              || echo "ld: unknown"
+          } > "$stage/usr/share/doc/photocraft/BUILD-INFO.txt"
+
+          if [ -f /tmp/abi-report.txt ]; then
+            cp /tmp/abi-report.txt "$stage/usr/share/doc/photocraft/ABI.txt"
+          fi
+
+          pushd "$work" >/dev/null
+          tar -cJf "$tarball" "$base"
+          sha256sum "$tarball" > SHA256SUMS
           cat SHA256SUMS
+          echo "contents:"
+          tar -tf "$tarball"
           popd >/dev/null
 
       - name: Upload the artifact
         uses: actions/upload-artifact@v4
         with:
-          name: photocraft-cli-loongarch64-oldworld-${{ inputs.profile }}
+          # Stable name: the labels a run carries (-dev/-fast/-unverified) are in the file name
+          # inside, which keeps "download the latest loongarch64 build" scriptable.
+          name: photocraft-loongarch64-oldworld
           path: |
-            dist/photocraft-cli-loongarch64-oldworld-*.tar.xz
+            dist/*.tar.xz
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
 
       - name: Write a build summary
         if: always()
-        env:
-          PROFILE: ${{ inputs.profile }}
         run: |
           {
-            echo "### LoongArch64 old world — photocraft-cli ($PROFILE)"
+            echo "### LoongArch64 old world — photocraft + photocraft-cli"
             echo
-            echo "Workspace: \`$PROJECT_ROOT\`"
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Version | \`${VERSION:-?}\` |"
+            echo "| Workspace | \`${PROJECT_ROOT:-?}\` |"
+            echo "| Profile | \`${BUILD_PROFILE:-?}\` (features \`${BUILD_FEATURES:-?}\`) |"
+            echo "| Link guard | \`${LINK_GUARD:-not run}\` |"
+            if [ "${UNVERIFIED:-0}" = "1" ]; then
+              echo "| ABI | **unverified** — checks failed, artifact labelled \`-unverified\` |"
+            else
+              echo "| ABI | checked (ld.so.1, ABI v0, max GLIBC 2.28) |"
+            fi
             echo
             if [ -f "$CHECKOUT_ROOT/dist/SHA256SUMS" ]; then
               echo '```'
