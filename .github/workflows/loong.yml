@@ -50,6 +50,9 @@ name: LoongArch old world
 on:
   workflow_dispatch:
     inputs:
+      project_path:
+        description: "Path to the PhotoCraft checkout, relative to the repo root (blank = auto-detect)"
+        default: ""
       profile:
         description: "Cargo profile to build"
         type: choice
@@ -96,6 +99,60 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v4
+
+      # The repository that runs this workflow is not necessarily the PhotoCraft workspace root:
+      # it may be a monorepo (the SAME repo can hold several craft apps) with PhotoCraft in a
+      # subdirectory. Every later step needs the checkout root for tools/caches and the workspace
+      # root for cargo, so resolve both here and publish them for the rest of the job.
+      - name: Locate the PhotoCraft workspace
+        env:
+          INPUT_PATH: ${{ inputs.project_path }}
+        run: |
+          set -euo pipefail
+          checkout="$GITHUB_WORKSPACE"
+
+          if [ -n "${INPUT_PATH// /}" ]; then
+            root="$checkout/${INPUT_PATH#/}"
+            if [ ! -f "$root/Cargo.toml" ]; then
+              echo "::error::project_path '$INPUT_PATH' has no Cargo.toml"
+              exit 1
+            fi
+          else
+            # Auto-detect the PhotoCraft workspace: the shallowest Cargo.toml that declares a
+            # [workspace] and has an apps/photocraft-cli package next to it. Testing for the
+            # package directory is deliberate -- the workspace manifest may list its members as
+            # a glob ("apps/*") rather than by name, so matching on member syntax is fragile.
+            root=""
+            while IFS= read -r manifest; do
+              dir=$(dirname "$manifest")
+              if grep -qE '^\[[[:space:]]*workspace[[:space:]]*\]' "$manifest" \
+                 && [ -f "$dir/apps/photocraft-cli/Cargo.toml" ]; then
+                root="$dir"
+                break
+              fi
+            done < <(
+              find "$checkout" -name Cargo.toml \
+                -not -path '*/target/*' -not -path '*/.git/*' -not -path '*/.loongarch/*' \
+                -not -path '*/vendor/*' \
+                -printf '%d %p\n' | sort -n | cut -d' ' -f2-
+            )
+            if [ -z "$root" ]; then
+              echo "::error::no PhotoCraft workspace found (a Cargo.toml with [workspace] and an apps/photocraft-cli package)."
+              echo "Set the 'project_path' input to the PhotoCraft directory."
+              echo "Cargo.toml files seen:"
+              find "$checkout" -name Cargo.toml -not -path '*/target/*' -not -path '*/.git/*' | head -20
+              exit 1
+            fi
+          fi
+
+          echo "::notice::PhotoCraft workspace: ${root#"$checkout"/} (checkout: $checkout)"
+          {
+            echo "PROJECT_ROOT=$root"
+            echo "CHECKOUT_ROOT=$checkout"
+          } >> "$GITHUB_ENV"
+
+          # Prove the package we intend to build really is in this workspace.
+          grep -nE 'name *= *"photocraft-cli"' "$root"/apps/photocraft-cli/Cargo.toml
 
       - name: Check the host toolchain has an ordinary cargo
         run: |
@@ -199,6 +256,7 @@ jobs:
           EXTRA_FEATURES: ${{ inputs.features }}
         run: |
           set -euo pipefail
+          cd "$PROJECT_ROOT"
           args=(--target "$LOONGNIX_TRIPLE" -p photocraft-cli --bins)
           if [ "$PROFILE" = "release" ]; then
             args+=(--release)
@@ -206,7 +264,10 @@ jobs:
           if [ -n "${EXTRA_FEATURES// /}" ]; then
             args+=(--features "$EXTRA_FEATURES")
           fi
+          echo "workspace: $PROJECT_ROOT"
           echo "cargo build ${args[*]}"
+          # Run cargo at the workspace root resolved by the "Locate" step (the checkout root is
+          # not necessarily the workspace root).
           # `--locked`: Cargo.lock is committed and must not drift. The Loongnix cargo's default
           # mirror lacks some pinned versions, so this uses the ordinary cargo and crates.io.
           cargo build --locked "${args[@]}"
@@ -217,9 +278,10 @@ jobs:
           PROFILE: ${{ inputs.profile }}
         run: |
           set -euo pipefail
+          cd "$PROJECT_ROOT"
           if [ "$PROFILE" = "release" ]; then out_dir=release; else out_dir=debug; fi
           bin="target/$LOONGNIX_TRIPLE/$out_dir/photocraft-cli"
-          test -x "$bin" || { echo "::error::missing $bin"; exit 1; }
+          test -x "$bin" || { echo "::error::missing $bin (cwd: $(pwd))"; exit 1; }
 
           echo "--- ELF header ---"
           readelf -h "$bin" | grep -E 'Machine|Flags'
@@ -291,28 +353,38 @@ jobs:
           PROFILE: ${{ inputs.profile }}
         run: |
           set -euo pipefail
+          cd "$PROJECT_ROOT"
           if [ "$PROFILE" = "release" ]; then out_dir=release; else out_dir=debug; fi
           bin="target/$LOONGNIX_TRIPLE/$out_dir/photocraft-cli"
           tarball="photocraft-cli-loongarch64-oldworld-$PROFILE.tar.xz"
 
-          mkdir -p dist
-          cp "$bin" dist/photocraft-cli
+          # Package under the checkout root, not the workspace root: the upload-artifact step
+          # resolves `path` relative to the checkout, and this keeps both in step no matter
+          # where PhotoCraft lives in the repository.
+          out="$CHECKOUT_ROOT/dist"
+          rm -rf "$out"
+          mkdir -p "$out"
+          cp "$bin" "$out/photocraft-cli"
           # Strip with Loongson's own strip: a host strip may not know EM_LOONGARCH (258) and
           # could refuse or corrupt the file.
-          "$GCC8/bin/loongarch64-linux-gnu-strip" --strip-unneeded dist/photocraft-cli
-          ls -lh dist/photocraft-cli
-          tar -C dist -cJf "$tarball" photocraft-cli
+          "$GCC8/bin/loongarch64-linux-gnu-strip" --strip-unneeded "$out/photocraft-cli"
+          ls -lh "$out/photocraft-cli"
+          # Build the archive from inside dist/ so it holds a bare `photocraft-cli` entry.
+          pushd "$out" >/dev/null
+          rm -f "$tarball" SHA256SUMS
+          tar -cJf "$tarball" photocraft-cli
 
-          sha256sum "$tarball" dist/photocraft-cli > SHA256SUMS
+          sha256sum "$tarball" photocraft-cli > SHA256SUMS
           cat SHA256SUMS
+          popd >/dev/null
 
       - name: Upload the artifact
         uses: actions/upload-artifact@v4
         with:
           name: photocraft-cli-loongarch64-oldworld-${{ inputs.profile }}
           path: |
-            photocraft-cli-loongarch64-oldworld-*.tar.xz
-            SHA256SUMS
+            dist/photocraft-cli-loongarch64-oldworld-*.tar.xz
+            dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
 
@@ -324,9 +396,11 @@ jobs:
           {
             echo "### LoongArch64 old world — photocraft-cli ($PROFILE)"
             echo
-            if [ -f SHA256SUMS ]; then
+            echo "Workspace: \`$PROJECT_ROOT\`"
+            echo
+            if [ -f "$CHECKOUT_ROOT/dist/SHA256SUMS" ]; then
               echo '```'
-              cat SHA256SUMS
+              cat "$CHECKOUT_ROOT/dist/SHA256SUMS"
               echo '```'
             else
               echo "_No artifact was produced._"
