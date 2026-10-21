@@ -1,4 +1,4 @@
-name: Build vera20k (manual)
+name: Build vera20k (manual + scheduled)
 
 # Cross-repo release workflow.
 #
@@ -13,9 +13,17 @@ name: Build vera20k (manual)
 # The fix: explicitly check out the SOURCE repo at the chosen ref, build
 # Windows x64 only, and publish the pre-release into THIS (workflow) repo.
 #
-# Trigger: manual (workflow_dispatch) with a `ref` input = the vera20k tag or
-# branch to build (e.g. v0.1.0). A `push: tags` trigger is intentionally NOT
-# used: tags pushed to vera20k do not fire workflows in this repo.
+# Triggers
+#   * workflow_dispatch - manual run with an explicit `ref` (tag or branch).
+#   * schedule          - twice a day, 08:30 and 20:30 Beijing time.
+#     A cron run carries NO inputs, so it builds the fallback ref (`main`) and
+#     the `publish` job is skipped automatically (its `if:` requires a `v*`
+#     ref). i.e. scheduled runs are build/verification only, no release.
+#     Caveats of `schedule`: it only fires from this repo's DEFAULT branch, and
+#     GitHub runs crons on a best-effort basis (often a few minutes late, and
+#     more under peak load).
+#   * `push: tags` is intentionally NOT used: tags pushed to vera20k do not
+#     fire workflows in this repo.
 on:
   workflow_dispatch:
     inputs:
@@ -23,12 +31,24 @@ on:
         description: 'Ref of YuriPlanet/vera20k to build (tag like v0.1.0, or a branch)'
         required: true
         default: 'main'
+  schedule:
+    # GitHub cron is ALWAYS UTC. Beijing time is UTC+8, so:
+    #   08:30 Beijing = 00:30 UTC
+    #   20:30 Beijing = 12:30 UTC
+    - cron: '30 0 * * *'    # 08:30 北京时间
+    - cron: '30 12 * * *'   # 20:30 北京时间
 
 permissions:
   contents: read
 
 env:
   SOURCE_REPO: YuriPlanet/vera20k
+  # Single source of truth for the ref being built:
+  #   - workflow_dispatch -> the `ref` input
+  #   - schedule          -> no inputs exist, so fall back to `main`
+  # Everything below (checkout, tag/version check, archive naming) reads this,
+  # so manual and scheduled runs stay consistent.
+  BUILD_REF: ${{ github.event.inputs.ref || 'main' }}
   # rust-lld ships with rustup and links much faster than link.exe. Linking the
   # C runtime statically removes the program's need for VCRUNTIME140.dll.
   CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld
@@ -55,15 +75,19 @@ jobs:
         # resolve here. No repo-relative working-directory override.
         working-directory: ${{ github.workspace }}
     steps:
+      # Must run BEFORE the checkout, otherwise the files on disk are already
+      # written and the setting has no effect (the metadata `sed` below would
+      # see CRLF line endings and fail to match).
+      - name: Force LF line endings for the checkout
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
       - name: Check out the SOURCE repo (cross-repo)
         uses: actions/checkout@v7
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ github.event.inputs.ref }}
+          ref: ${{ env.BUILD_REF }}
           # For a PRIVATE source repo, add: token: ${{ secrets.RELEASE_TOKEN }}
-      - name: Check out with LF line endings
-        if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
       - name: Read package metadata from Cargo.toml
         id: meta
         shell: bash
@@ -79,11 +103,12 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Require the ref to match the Cargo.toml version
-        if: startsWith(github.event.inputs.ref, 'v')
+        # Skipped for scheduled runs, where BUILD_REF is a branch (`main`).
+        if: startsWith(env.BUILD_REF, 'v')
         shell: bash
         run: |
-          if [ "v${{ steps.meta.outputs.version }}" != "${{ github.event.inputs.ref }}" ]; then
-            echo "Ref ${{ github.event.inputs.ref }} does not match Cargo.toml version ${{ steps.meta.outputs.version }} (expected v${{ steps.meta.outputs.version }})" >&2
+          if [ "v${{ steps.meta.outputs.version }}" != "${{ env.BUILD_REF }}" ]; then
+            echo "Ref ${{ env.BUILD_REF }} does not match Cargo.toml version ${{ steps.meta.outputs.version }} (expected v${{ steps.meta.outputs.version }})" >&2
             exit 1
           fi
       - uses: dtolnay/rust-toolchain@stable
@@ -105,7 +130,7 @@ jobs:
           set -euo pipefail
           name="${{ steps.meta.outputs.name }}"
           cv="${{ steps.meta.outputs.version }}"
-          ref="${{ github.event.inputs.ref }}"
+          ref="${{ env.BUILD_REF }}"
           # Archive version: keep the `v` prefix when building a tag (matches the
           # release tag), otherwise use the bare Cargo.toml version.
           if [[ "$ref" == v* ]]; then arc_ver="v$cv"; else arc_ver="$cv"; fi
@@ -122,9 +147,14 @@ jobs:
           path: |
             dist/*.zip
           if-no-files-found: error
+          # Two builds a day would otherwise pile up artifacts for the default
+          # 90 days. 7 days is enough to grab a build for debugging.
+          retention-days: 7
 
   publish:
-    if: startsWith(github.event.inputs.ref, 'v')
+    # Only a real release ref (`v*`) publishes. Scheduled runs build `main`,
+    # which does not start with `v`, so they never create a release.
+    if: startsWith(github.event.inputs.ref || '', 'v')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -155,5 +185,5 @@ jobs:
           # this workflow repo, so we do NOT use --verify-tag: gh will create the
           # tag in this repo from its default branch. The release artifacts still
           # come from the vera20k source we checked out.
-          gh release create "${{ github.event.inputs.ref }}" \
-            --prerelease --generate-notes --title "${{ needs.build.outputs.pkg_name }} ${{ github.event.inputs.ref }}" ./*
+          gh release create "${{ env.BUILD_REF }}" \
+            --prerelease --generate-notes --title "${{ needs.build.outputs.pkg_name }} ${{ env.BUILD_REF }}" ./*
