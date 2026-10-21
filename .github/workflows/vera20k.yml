@@ -36,7 +36,7 @@ on:
     #   08:30 Beijing = 00:30 UTC
     #   20:30 Beijing = 12:30 UTC
     - cron: '30 0 * * *'    # 08:30 北京时间
-    - cron: '30 12 * * *'   # 20:30 北京时间
+    - cron: '00 12 * * *'   # 20:30 北京时间
 
 permissions:
   contents: read
