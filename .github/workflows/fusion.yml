@@ -1,6 +1,6 @@
 # =============================================================================
 # 独立仓库（craft）中的手动编译工作流：交叉编译 Fusion 到 FreeBSD
-# 目标项目：https://github.com/sqrsus/fusion
+# 目标项目：https://github.com/0x2E/fusion （上游，已写死，构建时可覆盖分支）
 # 运行平台：serv00.com（FreeBSD amd64）
 #
 # 为什么需要这个工作流：
@@ -22,6 +22,10 @@
 #      （setup-go / pnpm / setup-node），不再引用任何本地复合 action。
 #   3. 构建入口仍复用 fusion 自带的 scripts.sh，不重写 pnpm / go 命令，
 #      上游改构建参数时本工作流自动跟随。
+#   4. 源码仓库写死为上游 0x2E/fusion（见 env.SRC_REPO），不再作为入参暴露，
+#      避免每次运行都要填写、也避免误填成别的仓库/分支组合。只保留
+#      source_ref 一个可调项（分支 / 标签 / 提交 SHA）。若需要临时改仓库，
+#      直接改 env.SRC_REPO 一行即可。
 #
 # 兼容性：Go 对 freebsd/amd64、freebsd/arm64 的最低目标为 FreeBSD 13.0，
 #   上机后用 uname -r 确认。
@@ -37,18 +41,23 @@ name: Build Fusion (FreeBSD)
 on:
   workflow_dispatch:
     inputs:
-      source_repository:
-        description: "fusion 源码仓库（owner/repo）"
-        required: true
-        default: "sqrsus/fusion"
       source_ref:
-        description: "要编译的分支 / 标签 / 提交 SHA"
+        description: "要编译的分支 / 标签 / 提交 SHA（仓库已固定为 0x2E/fusion）"
         required: true
         default: "main"
       arches:
-        description: "目标架构，空格分隔（amd64 arm64，可只填 amd64）"
+        # 用 choice 而不是自由文本：填错成 "freebsd" 会拼出
+        # GOOS=freebsd GOARCH=freebsd，go build 直接报
+        # "unsupported GOOS/GOARCH pair"。
+        # TARGET_OS 已硬编码为 freebsd，这里只需给架构。
+        description: "目标架构（只填架构，不要填 freebsd；serv00 为 amd64）"
         required: true
-        default: "amd64 arm64"
+        type: choice
+        default: "amd64"
+        options:
+          - "amd64"
+          - "amd64 arm64"
+          - "arm64"
   push:
     # 打 fusion-v* 标签时构建并发布到本仓库 Release（见 jobs.release）。
     # 不用 branches 触发：craft 仓库只放工作流，改其他文件不应连带重编 fusion。
@@ -67,10 +76,12 @@ env:
   # 源码检出到工作区的子目录，避免与 craft 自身的工作流文件同目录混淆
   SOURCE_PATH: fusion
   TARGET_OS: freebsd
+  # 源码仓库写死为上游；要临时构建别的仓库只改这一行。
+  # 注意：仓库若为私有，craft 的 GITHUB_TOKEN 读不到，需要 PAT。
+  SRC_REPO: 0x2E/fusion
   # push 事件下 inputs 为空，用 || 兜底；dispatch 时取用户输入
-  SRC_REPO: ${{ inputs.source_repository || 'sqrsus/fusion' }}
   SRC_REF: ${{ inputs.source_ref || 'main' }}
-  TARGET_ARCHES: ${{ inputs.arches || 'amd64 arm64' }}
+  TARGET_ARCHES: ${{ inputs.arches || 'amd64' }}
 
 jobs:
   build:
@@ -118,12 +129,32 @@ jobs:
           cache: pnpm
           cache-dependency-path: fusion/frontend/pnpm-lock.yaml
 
-      # ---------- 5. 前置校验：源码目录结构 ----------
-      # 上一版的失败模式（找不到 action.yml / 路径不对）应该在这里以明确的
-      # 报错暴露，而不是等到构建阶段才失败。
-      - name: "5. 校验源码目录结构"
+      # ---------- 5. 前置校验：架构入参 + 源码目录结构 ----------
+      # 上一版失败模式（找不到 action.yml / 路径不对），以及
+      # GOOS/GOARCH 填错（把 freebsd 填进 arches），都应在这里以明确的
+      # 报错暴露，而不是等到 go build 才抛 "unsupported GOOS/GOARCH pair"。
+      - name: "5. 校验入参（架构白名单）与源码目录结构"
+        # run 脚本保持纯 ASCII（与 openra.yml 的编码纪律一致），
+        # 中文只出现在注释与步骤名里。
+        # 5.1 架构只允许 amd64 / arm64：TARGET_OS 已由 env 固定为 freebsd，
+        #     不需要也不允许通过 arches 传入。
+        # 5.2 源码树完整性：checkout 的 repository/ref/path 不对时在此明确报错。
         run: |
           set -euo pipefail
+
+          for arch in $TARGET_ARCHES; do
+            case "$arch" in
+              amd64|arm64) ;;
+              *)
+                echo "FAIL: invalid arch '$arch' (TARGET_ARCHES='$TARGET_ARCHES')"
+                echo "GOOS is already fixed to '${TARGET_OS}' by env.TARGET_OS."
+                echo "The 'arches' input must list CPU architectures only: amd64 or arm64."
+                exit 1
+                ;;
+            esac
+          done
+          echo "target os/arch: ${TARGET_OS} / ${TARGET_ARCHES}"
+
           for f in scripts.sh LICENSE README.md \
                    backend/go.mod backend/go.sum backend/cmd/fusion/main.go \
                    frontend/package.json frontend/pnpm-lock.yaml; do
@@ -267,9 +298,9 @@ jobs:
 
       - name: "2. 创建或更新 Release，上传资产"
         # 注意：GITHUB_TOKEN 的写权限只作用于「本工作流所在的仓库」（craft），
-        # 所以发布目标是 craft 自己的 Release，不能挂到 sqrsus/fusion 的
-        # Release 上。若确实要挂到 fusion 仓库，需另配一个有 repo 权限的 PAT
-        # secret 并覆盖 GH_TOKEN，同时显式指定 GH_REPO。
+        # 所以发布目标是 craft 自己的 Release，不能挂到 0x2E/fusion 的
+        # Release 上（那也不是我们的仓库）。若确实要挂到别处，需另配一个有
+        # repo 权限的 PAT secret 并覆盖 GH_TOKEN，同时显式指定 GH_REPO。
         # 这里不依赖 fusion 仓库的 release.yml，因此不存在创建 Release 的竞争。
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
