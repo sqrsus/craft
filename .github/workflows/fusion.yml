@@ -30,10 +30,18 @@
 # 兼容性：Go 对 freebsd/amd64、freebsd/arm64 的最低目标为 FreeBSD 13.0，
 #   上机后用 uname -r 确认。
 #
+# 关于产物体积（容易被误判）：
+#   上游 v1.3.0 的 fusion-linux-amd64 裸二进制为 39.36 MB，而
+#   fusion_linux_amd64.zip 只有 20.39 MB。所以「40 MB 裸二进制」是正常值，
+#   与「20 多兆」的差别只是有没有 zip 压缩，不是构建出错。
+#   本工作流默认额外做一次剥符号（等价 -ldflags="-s -w"），通常再降 25%~35%；
+#   想与上游产物逐字节对齐时，把 strip 选成 false。
+#
 # 使用方式：
 #   1. Actions 页选择本工作流 -> Run workflow（或 gh workflow run fusion.yml）。
-#   2. 产物：该次 run 的 fusion-freebsd artifact；
-#      推送 fusion-v* 标签时额外发布到 craft 仓库的 Release。
+#   2. 产物：该次 run 的 fusion-freebsd artifact，扁平结构 =
+#      fusion-freebsd-<arch>（裸二进制，可直接 scp）+ checksums-freebsd.txt。
+#      本工作流只负责「编出产物」，不创建 Release、不上传任何资产。
 #   3. 部署：scp fusion-freebsd-amd64 LOGIN@HOST:/usr/home/LOGIN/fusion/fusion
 # =============================================================================
 name: Build Fusion (FreeBSD)
@@ -58,16 +66,21 @@ on:
           - "amd64"
           - "amd64 arm64"
           - "arm64"
-  push:
-    # 打 fusion-v* 标签时构建并发布到本仓库 Release（见 jobs.release）。
-    # 不用 branches 触发：craft 仓库只放工作流，改其他文件不应连带重编 fusion。
-    tags:
-      - "fusion-v*"
+      strip:
+        # 体积优化开关，默认开。剥离符号表与 DWARF，通常 -25%~-35%，
+        # 不影响运行（panic 堆栈仍带函数名与行号），也不影响 go version -m。
+        description: "剥离符号表与调试信息以减小体积（不影响运行）"
+        required: true
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
 
-# 同一 ref 同时只跑一个任务；中途取消会破坏 Release 资产的完整性
+# 同一 ref 同时只跑一个任务；中途取消会留下不完整的产物
 concurrency:
   group: build-fusion-${{ github.ref }}
   cancel-in-progress: false
@@ -79,9 +92,9 @@ env:
   # 源码仓库写死为上游；要临时构建别的仓库只改这一行。
   # 注意：仓库若为私有，craft 的 GITHUB_TOKEN 读不到，需要 PAT。
   SRC_REPO: 0x2E/fusion
-  # push 事件下 inputs 为空，用 || 兜底；dispatch 时取用户输入
   SRC_REF: ${{ inputs.source_ref || 'main' }}
   TARGET_ARCHES: ${{ inputs.arches || 'amd64' }}
+  STRIP: ${{ inputs.strip || 'true' }}
 
 jobs:
   build:
@@ -195,12 +208,69 @@ jobs:
           done
           ls -lh dist
 
-      # ---------- 9. 产物核对：读 ELF 头，不信任构建日志 ----------
+      # ---------- 9. 体积优化：剥离符号表与 DWARF（可选，默认开） ----------
+      # 先摆事实：上游 v1.3.0 的 fusion-linux-amd64 裸二进制为 39.36 MB，
+      # 而 fusion_linux_amd64.zip 只有 20.39 MB —— 差距全部来自 zip 压缩。
+      # 也就是说「40 MB 裸二进制」与上游一致，不是本工作流编错了。
+      # 上游 release.yml 也没做 strip（scripts.sh 只带 -trimpath 和
+      # -extldflags "-static"），所以官方产物同样未剥符号。
+      #
+      # 真正能减体积的是链接期剥符号，等价于 -ldflags="-s -w"：
+      #   -s 去掉符号表（.symtab/.strtab），-w 去掉 DWARF 调试信息
+      # 不影响运行：panic 堆栈靠 .gopclntab 还原函数名与行号，不会被剥掉；
+      # go version -m 读的是 .go.buildinfo 数据段，同样保留（下一条步骤会验证）。
+      # 不采用 UPX：会破坏 buildinfo 与 ELF 校验，且 FreeBSD 支持不确定。
+      - name: "9. 剥离符号表与调试信息"
+        # run 脚本保持纯 ASCII。GNU strip 是宿主机架构的（arm64 会失败），
+        # llvm-strip 与目标架构无关，优先找它，通常装在 /usr/lib/llvm-*/bin 下。
+        if: env.STRIP == 'true'
+        run: |
+          set -euo pipefail
+
+          find_strip() {
+            if command -v llvm-strip >/dev/null 2>&1; then
+              command -v llvm-strip
+              return 0
+            fi
+            for c in /usr/lib/llvm-*/bin/llvm-strip; do
+              if [ -x "$c" ]; then
+                printf '%s\n' "$c"
+                return 0
+              fi
+            done
+            printf '%s\n' ""
+          }
+
+          STRIP_BIN="$(find_strip)"
+          if [ -z "$STRIP_BIN" ] && command -v strip >/dev/null 2>&1; then
+            STRIP_BIN="strip"
+            echo "note: llvm-strip not found, falling back to GNU strip (amd64 only)"
+          fi
+          if [ -z "$STRIP_BIN" ]; then
+            echo "::warning::no strip tool found, keeping unstripped binaries"
+            exit 0
+          fi
+
+          for arch in $TARGET_ARCHES; do
+            bin="dist/fusion-$TARGET_OS-$arch"
+            if [ "$STRIP_BIN" = "strip" ] && [ "$arch" != "amd64" ]; then
+              echo "::warning::GNU strip cannot strip $arch, keeping $bin unstripped"
+              continue
+            fi
+            before=$(stat -c%s "$bin")
+            "$STRIP_BIN" --strip-all "$bin"
+            after=$(stat -c%s "$bin")
+            echo "$bin: $before -> $after bytes ($(( (before - after) * 100 / before ))% smaller)"
+          done
+
+      # ---------- 10. 产物核对：读 ELF 头，不信任构建日志 ----------
       # Go 二进制目标平台错了照样能编译成功，所以必须断言二进制本身：
       #   偏移 7  EI_OSABI  = 9   （FreeBSD；Linux 为 0，macOS 为 2）
       #   偏移 18 e_machine = 62  （x86-64）/ 183（AArch64）
       # 再用 go version -m 交叉核对 GOOS / GOARCH / CGO_ENABLED。
-      - name: "9. 断言产物确为 FreeBSD 静态二进制"
+      # 这一步同时兜住上一步的 strip：如果剥得太狠导致 buildinfo 丢失，
+      # go version -m 会报错，构建随即失败。
+      - name: "10. 断言产物确为 FreeBSD 静态二进制"
         run: |
           set -euo pipefail
           for arch in $TARGET_ARCHES; do
@@ -230,21 +300,20 @@ jobs:
             echo "OK  $bin  OSABI=FreeBSD(9)  e_machine=$machine  CGO_ENABLED=0"
           done
 
-      # ---------- 10. 打包 ----------
-      - name: "10. 打包 zip 与 sha256"
+      # ---------- 11. 生成校验和 ----------
+      # 本工作流只输出产物本身：一个裸二进制 + 一份 sha256。
+      # 不生成 zip、不打 Release、不上传任何资产 —— 需要分发时从 artifact 下载。
+      - name: "11. 生成校验和"
         run: |
           set -euo pipefail
           cd dist
-          for arch in $TARGET_ARCHES; do
-            bin="fusion-$TARGET_OS-$arch"
-            zip -j "fusion_${TARGET_OS}_${arch}.zip" "$bin" ../LICENSE* ../README* \
-              || zip -j "fusion_${TARGET_OS}_${arch}.zip" "$bin"
-          done
-          sha256sum ./*.zip ./fusion-$TARGET_OS-* > checksums-freebsd.txt
+          sha256sum fusion-$TARGET_OS-* > checksums-freebsd.txt
           cat checksums-freebsd.txt
+          echo
+          ls -l
 
-      # ---------- 11. 摘要 ----------
-      - name: "11. 写入 Job Summary"
+      # ---------- 12. 摘要 ----------
+      - name: "12. 写入 Job Summary"
         run: |
           set -euo pipefail
           {
@@ -267,56 +336,16 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- 12. 产物上传 ----------
-      - name: "12. 上传构建产物"
+      # ---------- 13. 产物上传 ----------
+      - name: "13. 上传构建产物"
         # uses 步骤的 path 相对工作区根目录，不受 defaults.run 的 working-directory
-        # 影响，所以要带 fusion/ 前缀。
+        # 影响，所以要带 fusion/ 前缀。两个路径的公共父目录是 fusion/dist，
+        # 因此 artifact 内是扁平结构：二进制 + 校验和，没有目录层级。
         uses: actions/upload-artifact@v7
         with:
           name: fusion-freebsd
           path: |
-            fusion/dist/fusion_freebsd_*.zip
             fusion/dist/fusion-freebsd-*
             fusion/dist/checksums-freebsd.txt
           if-no-files-found: error
           retention-days: 90
-
-  release:
-    name: Publish to craft release
-    if: startsWith(github.ref, 'refs/tags/fusion-v')
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - name: "1. 下载构建产物"
-        uses: actions/download-artifact@v7
-        with:
-          name: fusion-freebsd
-          path: dist
-
-      - name: "2. 创建或更新 Release，上传资产"
-        # 注意：GITHUB_TOKEN 的写权限只作用于「本工作流所在的仓库」（craft），
-        # 所以发布目标是 craft 自己的 Release，不能挂到 0x2E/fusion 的
-        # Release 上（那也不是我们的仓库）。若确实要挂到别处，需另配一个有
-        # repo 权限的 PAT secret 并覆盖 GH_TOKEN，同时显式指定 GH_REPO。
-        # 这里不依赖 fusion 仓库的 release.yml，因此不存在创建 Release 的竞争。
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" \
-              --title "Fusion FreeBSD $TAG" \
-              --notes "Cross-compiled Fusion (${SRC_REPO}@${SRC_REF}) for FreeBSD. Deploy target: serv00.com (FreeBSD >= 13.0)."
-          fi
-          gh release upload "$TAG" \
-            dist/*.zip \
-            dist/fusion-freebsd-* \
-            dist/checksums-freebsd.txt \
-            --clobber
-          echo "assets:"
-          gh release view "$TAG" --json assets --jq '.assets[].name'
