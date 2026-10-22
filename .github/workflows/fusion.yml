@@ -1,74 +1,161 @@
-name: freebsd
-
-# Purpose: cross-compile Fusion for FreeBSD (serv00.com hosting target).
+# =============================================================================
+# 独立仓库（craft）中的手动编译工作流：交叉编译 Fusion 到 FreeBSD
+# 目标项目：https://github.com/sqrsus/fusion
+# 运行平台：serv00.com（FreeBSD amd64）
 #
-# Why this workflow exists:
-#   ./scripts.sh release only produces linux/darwin/windows binaries. serv00.com
-#   runs FreeBSD on amd64, so the binary must be built with GOOS=freebsd.
-#   The backend uses modernc.org/sqlite (pure Go), so CGO_ENABLED=0 works and
-#   no FreeBSD C toolchain is needed.
+# 为什么需要这个工作流：
+#   fusion 自带的 ./scripts.sh release 只产出 linux / darwin / windows 三种产物，
+#   而 serv00.com 是 FreeBSD，必须用 GOOS=freebsd 编译。后端使用
+#   modernc.org/sqlite（纯 Go 实现），因此 CGO_ENABLED=0 即可，服务器上
+#   不需要任何 C 工具链。
 #
-# Compatibility: Go supports freebsd/amd64 and freebsd/arm64 with a minimum
-#   target of FreeBSD 13.0. Verify on the host with: uname -r
+# 与上一版的差异（上一版报错：
+#   Can't find 'action.yml' ... under '.../.github/actions/setup-toolchains'）：
+#   1. 根因：craft 仓库里只有工作流，既没有 fusion 源码，也没有 fusion 的复合
+#      action .github/actions/setup-toolchains/action.yml。上一版写了
+#      uses: ./.github/actions/setup-toolchains —— 本地 action 是从当前仓库
+#      工作区解析的，而 checkout 签出的是 craft 自己，因此必然找不到。
+#      这不是“漏了 checkout”（checkout 本来就在第一步），而是“补了 checkout
+#      也没用”，因为那个目录根本不在 craft 里。
+#   2. 现在改为 openra.yml 同款模式：actions/checkout 用 repository / ref /
+#      path 参数把 fusion 源码拉到 fusion/ 子目录，工具链全部在本文件内联安装
+#      （setup-go / pnpm / setup-node），不再引用任何本地复合 action。
+#   3. 构建入口仍复用 fusion 自带的 scripts.sh，不重写 pnpm / go 命令，
+#      上游改构建参数时本工作流自动跟随。
 #
-# How to use:
-#   1. Actions -> freebsd -> Run workflow, then download the "fusion-freebsd"
-#      artifact.
-#   2. Or locally: gh run download -n fusion-freebsd
-#   3. Deploy: scp dist/fusion-freebsd-amd64 LOGIN@HOST:/usr/home/LOGIN/fusion/fusion
+# 兼容性：Go 对 freebsd/amd64、freebsd/arm64 的最低目标为 FreeBSD 13.0，
+#   上机后用 uname -r 确认。
+#
+# 使用方式：
+#   1. Actions 页选择本工作流 -> Run workflow（或 gh workflow run fusion.yml）。
+#   2. 产物：该次 run 的 fusion-freebsd artifact；
+#      推送 fusion-v* 标签时额外发布到 craft 仓库的 Release。
+#   3. 部署：scp fusion-freebsd-amd64 LOGIN@HOST:/usr/home/LOGIN/fusion/fusion
+# =============================================================================
+name: Build Fusion (FreeBSD)
 
 on:
   workflow_dispatch:
+    inputs:
+      source_repository:
+        description: "fusion 源码仓库（owner/repo）"
+        required: true
+        default: "sqrsus/fusion"
+      source_ref:
+        description: "要编译的分支 / 标签 / 提交 SHA"
+        required: true
+        default: "main"
+      arches:
+        description: "目标架构，空格分隔（amd64 arm64，可只填 amd64）"
+        required: true
+        default: "amd64 arm64"
   push:
-    branches:
-      - main
+    # 打 fusion-v* 标签时构建并发布到本仓库 Release（见 jobs.release）。
+    # 不用 branches 触发：craft 仓库只放工作流，改其他文件不应连带重编 fusion。
     tags:
-      - "v*.*.*"
+      - "fusion-v*"
 
 permissions:
   contents: read
 
+# 同一 ref 同时只跑一个任务；中途取消会破坏 Release 资产的完整性
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  # never cancel mid-run: a killed gh release upload leaves partial assets
+  group: build-fusion-${{ github.ref }}
   cancel-in-progress: false
 
 env:
+  # 源码检出到工作区的子目录，避免与 craft 自身的工作流文件同目录混淆
+  SOURCE_PATH: fusion
   TARGET_OS: freebsd
-  TARGET_ARCHES: amd64 arm64
+  # push 事件下 inputs 为空，用 || 兜底；dispatch 时取用户输入
+  SRC_REPO: ${{ inputs.source_repository || 'sqrsus/fusion' }}
+  SRC_REF: ${{ inputs.source_ref || 'main' }}
+  TARGET_ARCHES: ${{ inputs.arches || 'amd64 arm64' }}
 
 jobs:
   build:
-    name: cross-compile freebsd
+    name: Cross-compile Fusion for FreeBSD
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        # scripts.sh 以 $(pwd) 作为仓库根来解析相对输出路径，且 build-backend
+        # 要求 backend/internal/web/dist/index.html 已存在，所以所有命令都
+        # 必须在 fusion/ 目录下执行。
+        working-directory: fusion
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      # ---------- 1. 源码获取：拉取外部仓库 fusion 到子目录 ----------
+      - name: "1. 检出 fusion 源码（外部仓库，拉到 fusion/ 子目录）"
+        uses: actions/checkout@v7
         with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_REF }}
+          path: ${{ env.SOURCE_PATH }}
           fetch-depth: 1
 
-      - name: Set up toolchains
-        uses: ./.github/actions/setup-toolchains
+      # ---------- 2. 工具链：Go（版本从 go.mod 读，不硬编码） ----------
+      - name: "2. 安装 Go（版本取自 fusion/backend/go.mod）"
+        uses: actions/setup-go@v6
         with:
-          setup-go: "true"
-          setup-node: "true"
-          node-version: "24"
-          pnpm-version: "10"
+          go-version-file: fusion/backend/go.mod
+          cache-dependency-path: fusion/backend/go.sum
 
-      - name: Report toolchain versions
+      # ---------- 3. 工具链：pnpm ----------
+      # frontend/package.json 里没有 packageManager 字段，corepack 无法自动定
+      # 版本，必须显式给 version。
+      - name: "3. 安装 pnpm 10"
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10"
+
+      # ---------- 4. 工具链：Node ----------
+      # frontend/package.json 的 engines.node 为 ">=24"，且 requirements 需在
+      # setup-node 之前装好 pnpm 才能用 cache: pnpm。
+      - name: "4. 安装 Node 24"
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: fusion/frontend/pnpm-lock.yaml
+
+      # ---------- 5. 前置校验：源码目录结构 ----------
+      # 上一版的失败模式（找不到 action.yml / 路径不对）应该在这里以明确的
+      # 报错暴露，而不是等到构建阶段才失败。
+      - name: "5. 校验源码目录结构"
         run: |
+          set -euo pipefail
+          for f in scripts.sh LICENSE README.md \
+                   backend/go.mod backend/go.sum backend/cmd/fusion/main.go \
+                   frontend/package.json frontend/pnpm-lock.yaml; do
+            if [ ! -f "$f" ]; then
+              echo "FAIL: $f not found under $(pwd)"
+              echo "The checkout step did not fetch the fusion source tree;"
+              echo "check env.SRC_REPO / env.SRC_REF and the checkout 'path' input."
+              exit 1
+            fi
+          done
+          echo "source tree OK at $(pwd)"
+          head -1 backend/go.mod
+
+      # ---------- 6. 环境报告 ----------
+      - name: "6. 报告工具链版本"
+        run: |
+          set -euo pipefail
           go version
           go env GOOS GOARCH CGO_ENABLED
           node --version
           pnpm --version
+          git rev-parse --short HEAD
 
-      - name: Build frontend bundle
-        # Builds frontend/dist and copies it into backend/internal/web/dist so
-        # that go:embed picks it up. backend build fails without this step.
+      # ---------- 7. 前端构建（后端 embed 依赖它，顺序不可调换） ----------
+      - name: "7. 构建前端并同步到 embed 目录"
+        # scripts.sh build-frontend = pnpm install --frozen-lockfile + run build
+        # + 把 frontend/dist 复制到 backend/internal/web/dist（go:embed 目标）。
+        # 少了这一步，build-backend 会直接 exit 1。
         run: ./scripts.sh build-frontend
 
-      - name: Cross-compile FreeBSD binaries
+      # ---------- 8. 后端交叉编译 ----------
+      - name: "8. 交叉编译 FreeBSD 二进制"
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -77,10 +164,12 @@ jobs:
           done
           ls -lh dist
 
-      - name: Verify artifacts are genuine FreeBSD binaries
-        # A Go binary for the wrong OS still builds fine, so assert the ELF
-        # header instead of trusting the build log. Offset 7 is EI_OSABI
-        # (9 = FreeBSD), offset 18 is e_machine (62 = x86-64, 183 = AArch64).
+      # ---------- 9. 产物核对：读 ELF 头，不信任构建日志 ----------
+      # Go 二进制目标平台错了照样能编译成功，所以必须断言二进制本身：
+      #   偏移 7  EI_OSABI  = 9   （FreeBSD；Linux 为 0，macOS 为 2）
+      #   偏移 18 e_machine = 62  （x86-64）/ 183（AArch64）
+      # 再用 go version -m 交叉核对 GOOS / GOARCH / CGO_ENABLED。
+      - name: "9. 断言产物确为 FreeBSD 静态二进制"
         run: |
           set -euo pipefail
           for arch in $TARGET_ARCHES; do
@@ -95,95 +184,108 @@ jobs:
               *) echo "FAIL: unknown arch $arch"; exit 1 ;;
             esac
 
-            [ "$osabi" = "9" ] || { echo "FAIL: $bin EI_OSABI=$osabi, want 9 (FreeBSD)"; exit 1; }
-            [ "$machine" = "$want_machine" ] || { echo "FAIL: $bin e_machine=$machine, want $want_machine"; exit 1; }
+            [ "$osabi" = "9" ] || \
+              { echo "FAIL: $bin EI_OSABI=$osabi, want 9 (FreeBSD)"; exit 1; }
+            [ "$machine" = "$want_machine" ] || \
+              { echo "FAIL: $bin e_machine=$machine, want $want_machine"; exit 1; }
 
-            go version -m "$bin" | grep -Eq "GOOS=$TARGET_OS\b" || { echo "FAIL: $bin GOOS mismatch"; exit 1; }
-            go version -m "$bin" | grep -Eq "GOARCH=$arch\b" || { echo "FAIL: $bin GOARCH mismatch"; exit 1; }
+            go version -m "$bin" | grep -Eq "GOOS=$TARGET_OS\b" || \
+              { echo "FAIL: $bin GOOS mismatch"; exit 1; }
+            go version -m "$bin" | grep -Eq "GOARCH=$arch\b" || \
+              { echo "FAIL: $bin GOARCH mismatch"; exit 1; }
+            go version -m "$bin" | grep -Eq "CGO_ENABLED=0" || \
+              { echo "FAIL: $bin is not built with CGO_ENABLED=0"; exit 1; }
 
-            echo "OK  $bin  OSABI=FreeBSD(9)  e_machine=$machine"
-            file "$bin" || true
+            echo "OK  $bin  OSABI=FreeBSD(9)  e_machine=$machine  CGO_ENABLED=0"
           done
 
-      - name: Package artifacts
+      # ---------- 10. 打包 ----------
+      - name: "10. 打包 zip 与 sha256"
         run: |
           set -euo pipefail
           cd dist
           for arch in $TARGET_ARCHES; do
-            zip -j "fusion_${TARGET_OS}_${arch}.zip" "fusion-$TARGET_OS-$arch" ../LICENSE ../README.md
+            bin="fusion-$TARGET_OS-$arch"
+            zip -j "fusion_${TARGET_OS}_${arch}.zip" "$bin" ../LICENSE* ../README* \
+              || zip -j "fusion_${TARGET_OS}_${arch}.zip" "$bin"
           done
           sha256sum ./*.zip ./fusion-$TARGET_OS-* > checksums-freebsd.txt
           cat checksums-freebsd.txt
 
-      - name: Write job summary
+      # ---------- 11. 摘要 ----------
+      - name: "11. 写入 Job Summary"
         run: |
           set -euo pipefail
           {
-            echo "### FreeBSD artifacts"
+            echo "### Fusion / FreeBSD artifacts"
             echo
-            echo '| file | size |'
-            echo '|---|---|'
+            echo "source: \`$SRC_REPO@$SRC_REF\`"
+            echo
+            echo "| file | size |"
+            echo "|---|---|"
             for arch in $TARGET_ARCHES; do
               bin="dist/fusion-$TARGET_OS-$arch"
               size=$(du -h "$bin" | cut -f1)
               echo "| fusion-$TARGET_OS-$arch | $size |"
             done
             echo
-            echo "Deploy amd64 (serv00.com):"
+            echo "Deploy amd64 to serv00.com:"
             echo
             echo '```'
             echo "scp dist/fusion-freebsd-amd64 LOGIN@HOST:/usr/home/LOGIN/fusion/fusion"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      # ---------- 12. 产物上传 ----------
+      - name: "12. 上传构建产物"
+        # uses 步骤的 path 相对工作区根目录，不受 defaults.run 的 working-directory
+        # 影响，所以要带 fusion/ 前缀。
+        uses: actions/upload-artifact@v7
         with:
           name: fusion-freebsd
           path: |
-            dist/fusion_freebsd_*.zip
-            dist/fusion-freebsd-*
-            dist/checksums-freebsd.txt
+            fusion/dist/fusion_freebsd_*.zip
+            fusion/dist/fusion-freebsd-*
+            fusion/dist/checksums-freebsd.txt
           if-no-files-found: error
           retention-days: 90
 
   release:
-    name: attach assets to release
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Publish to craft release
+    if: startsWith(github.ref, 'refs/tags/fusion-v')
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
-      actions: read
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - name: "1. 下载构建产物"
+        uses: actions/download-artifact@v7
         with:
           name: fusion-freebsd
           path: dist
 
-      - name: Attach FreeBSD assets to the release
-        # release.yml also runs on the same tag and creates the GitHub Release.
-        # Wait for it instead of racing with another `gh release create`.
+      - name: "2. 创建或更新 Release，上传资产"
+        # 注意：GITHUB_TOKEN 的写权限只作用于「本工作流所在的仓库」（craft），
+        # 所以发布目标是 craft 自己的 Release，不能挂到 sqrsus/fusion 的
+        # Release 上。若确实要挂到 fusion 仓库，需另配一个有 repo 权限的 PAT
+        # secret 并覆盖 GH_TOKEN，同时显式指定 GH_REPO。
+        # 这里不依赖 fusion 仓库的 release.yml，因此不存在创建 Release 的竞争。
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          for i in $(seq 1 20); do
-            if gh release view "$TAG" >/dev/null 2>&1; then
-              echo "release $TAG is ready"
-              break
-            fi
-            echo "release $TAG not ready yet (attempt $i/20), waiting 15s"
-            sleep 15
-          done
-          gh release view "$TAG" >/dev/null
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "Fusion FreeBSD $TAG" \
+              --notes "Cross-compiled Fusion (${SRC_REPO}@${SRC_REF}) for FreeBSD. Deploy target: serv00.com (FreeBSD >= 13.0)."
+          fi
           gh release upload "$TAG" \
             dist/*.zip \
             dist/fusion-freebsd-* \
             dist/checksums-freebsd.txt \
             --clobber
-          echo "uploaded:"
+          echo "assets:"
           gh release view "$TAG" --json assets --jq '.assets[].name'
