@@ -1,0 +1,189 @@
+name: freebsd
+
+# Purpose: cross-compile Fusion for FreeBSD (serv00.com hosting target).
+#
+# Why this workflow exists:
+#   ./scripts.sh release only produces linux/darwin/windows binaries. serv00.com
+#   runs FreeBSD on amd64, so the binary must be built with GOOS=freebsd.
+#   The backend uses modernc.org/sqlite (pure Go), so CGO_ENABLED=0 works and
+#   no FreeBSD C toolchain is needed.
+#
+# Compatibility: Go supports freebsd/amd64 and freebsd/arm64 with a minimum
+#   target of FreeBSD 13.0. Verify on the host with: uname -r
+#
+# How to use:
+#   1. Actions -> freebsd -> Run workflow, then download the "fusion-freebsd"
+#      artifact.
+#   2. Or locally: gh run download -n fusion-freebsd
+#   3. Deploy: scp dist/fusion-freebsd-amd64 LOGIN@HOST:/usr/home/LOGIN/fusion/fusion
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # never cancel mid-run: a killed gh release upload leaves partial assets
+  cancel-in-progress: false
+
+env:
+  TARGET_OS: freebsd
+  TARGET_ARCHES: amd64 arm64
+
+jobs:
+  build:
+    name: cross-compile freebsd
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Set up toolchains
+        uses: ./.github/actions/setup-toolchains
+        with:
+          setup-go: "true"
+          setup-node: "true"
+          node-version: "24"
+          pnpm-version: "10"
+
+      - name: Report toolchain versions
+        run: |
+          go version
+          go env GOOS GOARCH CGO_ENABLED
+          node --version
+          pnpm --version
+
+      - name: Build frontend bundle
+        # Builds frontend/dist and copies it into backend/internal/web/dist so
+        # that go:embed picks it up. backend build fails without this step.
+        run: ./scripts.sh build-frontend
+
+      - name: Cross-compile FreeBSD binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in $TARGET_ARCHES; do
+            ./scripts.sh build-backend "$TARGET_OS" "$arch" "./dist/fusion-$TARGET_OS-$arch"
+          done
+          ls -lh dist
+
+      - name: Verify artifacts are genuine FreeBSD binaries
+        # A Go binary for the wrong OS still builds fine, so assert the ELF
+        # header instead of trusting the build log. Offset 7 is EI_OSABI
+        # (9 = FreeBSD), offset 18 is e_machine (62 = x86-64, 183 = AArch64).
+        run: |
+          set -euo pipefail
+          for arch in $TARGET_ARCHES; do
+            bin="dist/fusion-$TARGET_OS-$arch"
+            test -f "$bin" || { echo "FAIL: $bin missing"; exit 1; }
+
+            osabi=$(od -An -tu1 -j7 -N1 "$bin" | tr -d ' \n')
+            machine=$(od -An -tu2 -j18 -N2 "$bin" | tr -d ' \n')
+            case "$arch" in
+              amd64) want_machine=62 ;;
+              arm64) want_machine=183 ;;
+              *) echo "FAIL: unknown arch $arch"; exit 1 ;;
+            esac
+
+            [ "$osabi" = "9" ] || { echo "FAIL: $bin EI_OSABI=$osabi, want 9 (FreeBSD)"; exit 1; }
+            [ "$machine" = "$want_machine" ] || { echo "FAIL: $bin e_machine=$machine, want $want_machine"; exit 1; }
+
+            go version -m "$bin" | grep -Eq "GOOS=$TARGET_OS\b" || { echo "FAIL: $bin GOOS mismatch"; exit 1; }
+            go version -m "$bin" | grep -Eq "GOARCH=$arch\b" || { echo "FAIL: $bin GOARCH mismatch"; exit 1; }
+
+            echo "OK  $bin  OSABI=FreeBSD(9)  e_machine=$machine"
+            file "$bin" || true
+          done
+
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          cd dist
+          for arch in $TARGET_ARCHES; do
+            zip -j "fusion_${TARGET_OS}_${arch}.zip" "fusion-$TARGET_OS-$arch" ../LICENSE ../README.md
+          done
+          sha256sum ./*.zip ./fusion-$TARGET_OS-* > checksums-freebsd.txt
+          cat checksums-freebsd.txt
+
+      - name: Write job summary
+        run: |
+          set -euo pipefail
+          {
+            echo "### FreeBSD artifacts"
+            echo
+            echo '| file | size |'
+            echo '|---|---|'
+            for arch in $TARGET_ARCHES; do
+              bin="dist/fusion-$TARGET_OS-$arch"
+              size=$(du -h "$bin" | cut -f1)
+              echo "| fusion-$TARGET_OS-$arch | $size |"
+            done
+            echo
+            echo "Deploy amd64 (serv00.com):"
+            echo
+            echo '```'
+            echo "scp dist/fusion-freebsd-amd64 LOGIN@HOST:/usr/home/LOGIN/fusion/fusion"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusion-freebsd
+          path: |
+            dist/fusion_freebsd_*.zip
+            dist/fusion-freebsd-*
+            dist/checksums-freebsd.txt
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: attach assets to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: fusion-freebsd
+          path: dist
+
+      - name: Attach FreeBSD assets to the release
+        # release.yml also runs on the same tag and creates the GitHub Release.
+        # Wait for it instead of racing with another `gh release create`.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "release $TAG is ready"
+              break
+            fi
+            echo "release $TAG not ready yet (attempt $i/20), waiting 15s"
+            sleep 15
+          done
+          gh release view "$TAG" >/dev/null
+          gh release upload "$TAG" \
+            dist/*.zip \
+            dist/fusion-freebsd-* \
+            dist/checksums-freebsd.txt \
+            --clobber
+          echo "uploaded:"
+          gh release view "$TAG" --json assets --jq '.assets[].name'
