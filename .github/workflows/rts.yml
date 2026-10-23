@@ -1,8 +1,12 @@
 # ConcordRTS — automated Windows x64 release build (clang-cl + Ninja)
 #
-# This workflow is self-contained: it builds the source tree of *this* repository.
-# It must live in the NEW repository you created for the source snapshot; it is
-# never pushed to the upstream project.
+# This workflow is self-contained: it fetches the upstream source tree at run
+# time and builds it here. The repository that hosts it only needs this one
+# file — no local clone, no 1888-file upload, no upstream history.
+#
+# Source is cloned into $GITHUB_WORKSPACE\source, so the hosting repository's
+# own contents are irrelevant to the build. Point SOURCE_REPOSITORY / SOURCE_REF
+# at a fork or a tag when needed (see the workflow_dispatch inputs).
 #
 # Documented toolchain contract (README "编译"):
 #   Windows x64, Windows PowerShell 5.1, LLVM (clang-cl/lld-link/llvm-lib/llvm-readobj),
@@ -26,6 +30,14 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      source_repository:
+        description: 'Upstream repository to build (owner/name)'
+        required: false
+        default: 'AdrianLuo-X/ConcordRTS'
+      source_ref:
+        description: 'Branch, tag or full 40-character commit SHA'
+        required: false
+        default: 'main'
       llvm_version:
         description: 'LLVM version to provision (or "image" to use the runner LLVM)'
         required: false
@@ -44,12 +56,18 @@ concurrency:
 
 defaults:
   run:
-    shell: powershell
+    # -NoProfile keeps startup independent of any profile the image may ship;
+    # the explicit Bypass matches how the project's own scripts are invoked.
+    shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
 
 env:
   # Pinned to the project's validated release. Override with a repository variable
   # or a manual dispatch input; use "image" to fall back to the runner's LLVM.
   CONCORD_LLVM_VERSION: ${{ inputs.llvm_version || vars.CONCORD_LLVM_VERSION || '22.1.3' }}
+  # Where the source comes from. A fork can be built by overriding these without
+  # editing the file (workflow_dispatch inputs or repository variables).
+  SOURCE_REPOSITORY: ${{ inputs.source_repository || vars.CONCORD_SOURCE_REPOSITORY || 'AdrianLuo-X/ConcordRTS' }}
+  SOURCE_REF: ${{ inputs.source_ref || vars.CONCORD_SOURCE_REF || 'main' }}
   CONFIGURATION: Release
   # PROJECT_ROOT and BUILD_DIR are derived by the "Validate project layout" step:
   # no path in this workflow relies on the runner's current directory.
@@ -59,20 +77,108 @@ jobs:
     name: Build + package
     runs-on: windows-2022
     timeout-minutes: 120
+    outputs:
+      source_commit: ${{ steps.fetch.outputs.commit }}
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Validate project layout
-        # Resolves PROJECT_ROOT and BUILD_DIR and fails with a readable report
-        # before any tool is downloaded. Two failure modes are possible when a
-        # source snapshot is committed by hand: the tree is stored one level
-        # below the workspace root, or parts of it (tools/, cmake/) are absent.
-        # Both used to surface only as a cryptic "-File ... does not exist".
+      - name: Fetch upstream source
+        id: fetch
+        # The hosting repository holds only this workflow, so nothing is checked
+        # out from it. The upstream tree is cloned into $GITHUB_WORKSPACE\source
+        # and the resolved commit is exported for provenance.
+        env:
+          # Optional: only needed for a private fork. A public source needs no
+          # credential at all, so the anonymous URL is used by default.
+          SOURCE_TOKEN: ${{ secrets.CONCORD_SOURCE_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git is not available on PATH.' }
+
+          $repo = $env:SOURCE_REPOSITORY
+          $ref = $env:SOURCE_REF
+          if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+            throw "SOURCE_REPOSITORY must look like owner/name, got '$repo'."
+          }
+          $ref = $ref -replace '^refs/(heads|tags)/', ''
+          if ([string]::IsNullOrWhiteSpace($ref)) { $ref = 'main' }
+
+          $workspace = $env:GITHUB_WORKSPACE
+          New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+          $dest = Join-Path $workspace 'source'
+          if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+
+          # Never let git block on an interactive credential prompt.
+          $env:GIT_TERMINAL_PROMPT = '0'
+
+          $anonUrl = "https://github.com/$repo.git"
+          $cloneUrl = $anonUrl
+          if (-not [string]::IsNullOrWhiteSpace($env:SOURCE_TOKEN)) {
+            $cloneUrl = "https://x-access-token:$($env:SOURCE_TOKEN)@github.com/$repo.git"
+            Write-Host "Using CONCORD_SOURCE_TOKEN to read $repo."
+          }
+
+          # A stalled transfer must fail in about a minute instead of holding the
+          # step open: abort once throughput drops below 1 KB/s for 60 seconds.
+          # Two attempts cover the usual transient runner-side network blip.
+          $lastError = ''
+          for ($attempt = 1; $attempt -le 2; $attempt++) {
+            if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+
+            if ($ref -match '^[0-9a-fA-F]{40}$') {
+              Write-Host "Fetching commit $ref from $repo (attempt $attempt)"
+              git init --quiet $dest
+              if ($LASTEXITCODE -ne 0) { throw 'git init failed.' }
+              git -C $dest remote add origin $cloneUrl
+              git -C $dest -c protocol.version=2 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 fetch --depth 1 --quiet origin $ref
+              $lastError = "git fetch failed for $repo@$ref (unreachable commit, or private without CONCORD_SOURCE_TOKEN?)."
+              if ($LASTEXITCODE -eq 0) {
+                git -C $dest checkout --quiet FETCH_HEAD
+                $lastError = 'git checkout of the fetched commit failed.'
+                if ($LASTEXITCODE -eq 0) { break }
+              }
+            } else {
+              Write-Host "Cloning $repo at $ref (attempt $attempt, depth 1)"
+              git -c protocol.version=2 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 clone --depth 1 --single-branch --no-tags --branch $ref --quiet $cloneUrl $dest
+              $lastError = "git clone failed for $repo@$ref (bad ref, or private without CONCORD_SOURCE_TOKEN?)."
+              if ($LASTEXITCODE -eq 0) { break }
+            }
+
+            if ($attempt -lt 2) {
+              Write-Warning "$lastError Retrying in 5 seconds."
+              Start-Sleep -Seconds 5
+            }
+          }
+          if ($LASTEXITCODE -ne 0) { throw $lastError }
+
+          # Drop the credential from the recorded remote so later steps cannot leak it.
+          git -C $dest remote set-url origin $anonUrl
+
+          $commit = (git -C $dest rev-parse HEAD)
+          if ($LASTEXITCODE -ne 0 -or -not $commit) { throw 'Could not resolve the source commit.' }
+          $commit = $commit.Trim()
+          Write-Host "SOURCE_COMMIT = $commit"
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "SOURCE_COMMIT=$commit`n", $utf8)
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "commit=$commit`n", $utf8)
+          [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, "Source: ``$repo`` @ ``$ref`` ($commit)`n")
+
+      - name: Validate project layout
+        # Resolves PROJECT_ROOT and BUILD_DIR before any tool is downloaded, and
+        # fails with a readable report. A clone that silently produced a partial
+        # tree (wrong ref, missing files) or a tree parked in a subdirectory would
+        # otherwise surface much later as a cryptic "-File ... does not exist".
+        #
+        # The happy path costs three [IO.File]::Exists calls. Every phase prints
+        # a wall-clock trace (so a stall reports where it stopped instead of an
+        # empty log) and all directory scans are capped.
+        timeout-minutes: 10
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $ErrorActionPreference = 'Stop'
+
+          $clock = [Diagnostics.Stopwatch]::StartNew()
+          function Trace([string]$Message) {
+            Write-Host ('[{0,6:N1}s] {1}' -f $clock.Elapsed.TotalSeconds, $Message)
+          }
 
           function Set-JobEnv([string]$Name, [string]$Value) {
             if ([string]::IsNullOrWhiteSpace($Value)) { throw "Empty value for $Name" }
@@ -81,50 +187,60 @@ jobs:
             Write-Host "$Name = $Value"
           }
 
+          Trace 'start'
           $workspace = $env:GITHUB_WORKSPACE
-          Write-Host "GITHUB_WORKSPACE = $workspace"
-          Write-Host "Current location = $(Get-Location)"
+          if ([string]::IsNullOrWhiteSpace($workspace)) { throw 'GITHUB_WORKSPACE is not set.' }
+          if (-not [IO.Directory]::Exists($workspace)) { throw "GITHUB_WORKSPACE does not exist: $workspace" }
+          Trace "workspace = $workspace"
+          Trace "current location = $(Get-Location)"
 
           $markers = @('CMakeLists.txt', 'cmake\GameTargets.cmake', 'tools\Build-Game.ps1')
           function Test-ProjectRoot([string]$Path) {
             foreach ($marker in $markers) {
-              if (-not (Test-Path -LiteralPath (Join-Path $Path $marker) -PathType Leaf)) { return $false }
+              if (-not [IO.File]::Exists((Join-Path $Path $marker))) { return $false }
             }
             return $true
           }
 
-          # Workspace root first, then its direct, non-hidden children.
-          $candidates = @($workspace)
-          $candidates += @(
-            Get-ChildItem -LiteralPath $workspace -Directory -Force -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -notlike '.*' } |
-              ForEach-Object { $_.FullName }
-          )
-          $found = @($candidates | Where-Object { Test-ProjectRoot $_ } | Select-Object -Unique)
+          # Workspace root first, then its direct, non-hidden children. Capped so
+          # a pathological checkout cannot turn this probe into a long scan.
+          $candidates = New-Object 'System.Collections.Generic.List[string]'
+          $candidates.Add($workspace)
+          $scanned = 0
+          $cap = 40
+          foreach ($dir in [IO.Directory]::EnumerateDirectories($workspace)) {
+            if ([IO.Path]::GetFileName($dir).StartsWith('.')) { continue }
+            if ($scanned -ge $cap) { Trace "directory scan capped at $cap entries"; break }
+            $candidates.Add($dir)
+            $scanned++
+          }
+          Trace "candidates to probe: $($candidates.Count)"
 
-          if ($found.Count -eq 0) {
+          $projectRoot = $null
+          foreach ($candidate in $candidates) {
+            if (Test-ProjectRoot $candidate) { $projectRoot = $candidate; break }
+          }
+          if (-not $projectRoot) {
+            Trace 'no source tree matched'
             Write-Host ''
-            Write-Host 'Workspace root contents:'
-            Get-ChildItem -LiteralPath $workspace -Force |
-              Sort-Object PSIsContainer -Descending |
-              ForEach-Object { Write-Host ('  {0} {1}' -f $(if ($_.PSIsContainer) { '[dir] ' } else { '[file]' }), $_.Name) }
-            Write-Host ''
-            Write-Host 'Required project markers that were not found:'
-            foreach ($marker in $markers) {
-              $hit = @($candidates | Where-Object { Test-Path -LiteralPath (Join-Path $_ $marker) -PathType Leaf })
-              if ($hit.Count -eq 0) { Write-Host "  - $marker" }
+            Write-Host "Top-level entries of $workspace (at most 40):"
+            $shown = 0
+            foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($workspace)) {
+              if ($shown -ge 40) { Write-Host '  ...'; break }
+              $kind = if ([IO.Directory]::Exists($entry)) { '[dir] ' } else { '[file]' }
+              Write-Host ('  {0} {1}' -f $kind, [IO.Path]::GetFileName($entry))
+              $shown++
             }
+            Write-Host ''
+            Write-Host 'Required project markers that were not found anywhere scanned:'
+            foreach ($marker in $markers) { Write-Host "  - $marker" }
             $detail = "Source tree not found. Expected $($markers -join ', ') at $workspace " +
                       'or in one of its immediate subdirectories. ' +
                       'The checked-out commit does not contain a complete ConcordRTS source snapshot; ' +
                       'commit the whole tree (CMakeLists.txt, cmake/, tools/, src/) instead of a partial copy.'
             throw $detail
           }
-          if ($found.Count -gt 1) {
-            Write-Warning ("Multiple source trees matched; using the first: " + ($found -join ' | '))
-          }
-          $projectRoot = $found[0]
-          Write-Host "PROJECT_ROOT  = $projectRoot"
+          Trace "project root = $projectRoot"
 
           $required = @(
             'CMakeLists.txt',
@@ -143,7 +259,7 @@ jobs:
 
           $missing = @()
           foreach ($rel in $required) {
-            if (-not (Test-Path -LiteralPath (Join-Path $projectRoot $rel) -PathType Leaf)) { $missing += $rel }
+            if (-not [IO.File]::Exists((Join-Path $projectRoot $rel))) { $missing += $rel }
           }
           if ($missing.Count) {
             $detail = 'Source snapshot is incomplete. Missing: ' + ($missing -join ', ') +
@@ -151,7 +267,7 @@ jobs:
             throw $detail
           }
           foreach ($rel in $optional) {
-            if (-not (Test-Path -LiteralPath (Join-Path $projectRoot $rel) -PathType Leaf)) {
+            if (-not [IO.File]::Exists((Join-Path $projectRoot $rel))) {
               Write-Warning "Optional project script absent from this snapshot: $rel"
             }
           }
@@ -160,17 +276,22 @@ jobs:
           Set-JobEnv 'PROJECT_ROOT' $projectRoot
           Set-JobEnv 'BUILD_DIR' $buildDir
           [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, "Project root: ``$projectRoot`` (validated)`n")
+          Trace 'done'
 
       - name: Source repository guard
         # Project-owned check: refuses tracked game assets, build outputs and
         # oversized blobs before any compilation starts. It is a hygiene gate,
-        # not part of the compiler contract, so a snapshot that predates the
-        # script still builds (with a warning) instead of failing here.
+        # not part of the compiler contract: a snapshot that predates the script,
+        # or a tree without a Git index, still builds with a warning.
         run: |
           $ErrorActionPreference = 'Stop'
           $guard = Join-Path $env:PROJECT_ROOT 'tools\Check-SourceRepository.ps1'
           if (-not (Test-Path -LiteralPath $guard -PathType Leaf)) {
             Write-Warning 'tools\Check-SourceRepository.ps1 is not present in this snapshot; skipping the repository hygiene guard.'
+            return
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:PROJECT_ROOT '.git'))) {
+            Write-Warning 'Source tree has no Git index (not a clone); skipping the repository hygiene guard.'
             return
           }
           & powershell -NoProfile -ExecutionPolicy Bypass -File $guard -ProjectRoot $env:PROJECT_ROOT -TrackedOnly
@@ -377,10 +498,13 @@ jobs:
             if ($machine -ne $pair[1]) { throw ("Unexpected PE machine 0x{0:x4} in {1}" -f $machine, $file) }
           }
 
-          # "out/" is already excluded by the project .gitignore.
+          # "out/" lives next to the source clone and is never inside it, so the
+          # package cannot pick up .git metadata.
           $dist = Join-Path $env:GITHUB_WORKSPACE 'out'
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
-          $zipName = "ConcordRTS-$($env:GITHUB_SHA.Substring(0, 12))-windows-x64.zip"
+          $sourceCommit = $env:SOURCE_COMMIT
+          if ($sourceCommit.Length -lt 12) { throw "Unexpected SOURCE_COMMIT value: '$sourceCommit'" }
+          $zipName = "ConcordRTS-$($sourceCommit.Substring(0, 12))-windows-x64.zip"
           $zip = Join-Path $dist $zipName
           Compress-Archive -Path (Join-Path $stage.FullName '*') -DestinationPath $zip -Force
 
@@ -388,10 +512,12 @@ jobs:
           $info = @(
             'ConcordRTS prebuilt package',
             '',
-            "Repository : $env:GITHUB_REPOSITORY",
-            "Commit     : $env:GITHUB_SHA",
-            "Ref        : $env:GITHUB_REF",
-            "Built at   : $((Get-Date).ToUniversalTime().ToString('o'))",
+            "Source repository : $env:SOURCE_REPOSITORY",
+            "Source ref        : $env:SOURCE_REF",
+            "Source commit     : $sourceCommit",
+            "Workflow repo     : $env:GITHUB_REPOSITORY",
+            "Workflow run      : $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID",
+            "Built at          : $((Get-Date).ToUniversalTime().ToString('o'))",
             '',
             'Toolchain',
             $env:TOOLCHAIN_IDENTITY,
@@ -479,8 +605,11 @@ jobs:
           $lines += ''
           $lines += '| Item | Value |'
           $lines += '| --- | --- |'
-          $lines += '| Commit | ' + $env:GITHUB_SHA + ' |'
-          $lines += '| Ref | ' + $env:GITHUB_REF + ' |'
+          $lines += '| Source repository | ' + $env:SOURCE_REPOSITORY + ' |'
+          $lines += '| Source ref | ' + $env:SOURCE_REF + ' |'
+          if ($env:SOURCE_COMMIT) { $lines += '| Source commit | `' + $env:SOURCE_COMMIT + '` |' }
+          $lines += '| Workflow repo | ' + $env:GITHUB_REPOSITORY + '@' + $env:GITHUB_SHA.Substring(0, 7) + ' |'
+          $lines += '| Trigger | ' + $env:GITHUB_EVENT_NAME + ' (' + $env:GITHUB_REF + ') |'
           $lines += '| Runner | ' + $env:RUNNER_OS + ' / ' + $env:RUNNER_ARCH + ' |'
           $lines += '| Project root | ' + $env:PROJECT_ROOT + ' |'
           $lines += '| Build directory | ' + $env:BUILD_DIR + ' |'
@@ -516,16 +645,33 @@ jobs:
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The release belongs to this repository, but its content comes from
+          # upstream; record which commit was actually built.
+          RELEASE_SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = $env:GITHUB_REF_NAME
           $zip = Get-ChildItem -LiteralPath 'out' -Filter *.zip | Select-Object -First 1
           if (-not $zip) { throw 'No package zip was downloaded.' }
+
+          $lines = @(
+            "Windows x64 build of ``$env:SOURCE_REPOSITORY`` at ``$env:SOURCE_REF``."
+            ''
+            "Source commit: ``$($env:RELEASE_SOURCE_COMMIT)``"
+            ''
+            'Built with clang-cl + Ninja (LLVM 22.1.3 toolchain contract). The zip contains'
+            'BUILD-INFO.txt (toolchain identity, per-file SHA-256) and build-provenance.json.'
+            ''
+            'This package contains engine binaries and Microsoft CRT redistributables only.'
+            'Original RA2/YR game data, Binkw32.dll and retail assets are not included and'
+            'must be supplied locally.'
+          ) -join "`n"
+
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag exists; uploading the asset with --clobber."
             gh release upload $tag $zip.FullName --repo $env:GITHUB_REPOSITORY --clobber
           } else {
-            gh release create $tag $zip.FullName --repo $env:GITHUB_REPOSITORY --title $tag --generate-notes
+            gh release create $tag $zip.FullName --repo $env:GITHUB_REPOSITORY --title $tag --notes $lines
           }
           if ($LASTEXITCODE -ne 0) { throw "Release publishing failed (exit $LASTEXITCODE)" }
