@@ -1,0 +1,414 @@
+# ConcordRTS — automated Windows x64 release build (clang-cl + Ninja)
+#
+# This workflow is self-contained: it builds the source tree of *this* repository.
+# It must live in the NEW repository you created for the source snapshot; it is
+# never pushed to the upstream project.
+#
+# Documented toolchain contract (README "编译"):
+#   Windows x64, Windows PowerShell 5.1, LLVM (clang-cl/lld-link/llvm-lib/llvm-readobj),
+#   CMake >= 3.20, Ninja, MSVC x64+x86 headers/libs, x64 CRT redistributables, Windows SDK.
+#   Validated combination: LLVM 22.1.3, CMake 4.3.x, Ninja 1.13.2,
+#   MSVC 14.51.36231, ABI compat 19.51.36257, Windows SDK 10.0.26100.0.
+#
+# Nothing in this file requires a Visual Studio "developer prompt": the project
+# toolchain resolves every system include/library path explicitly, and the build
+# entry point refuses to run when CL/_CL_/LINK/_LINK_ are set in the environment.
+
+name: Build (Windows x64 / clang-cl)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      llvm_version:
+        description: 'LLVM version to provision (or "image" to use the runner LLVM)'
+        required: false
+        default: '22.1.3'
+      run_tests:
+        description: 'Run the asset-free windows-minimal test profile after building'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: powershell
+
+env:
+  # Pinned to the project's validated release. Override with a repository variable
+  # or a manual dispatch input; use "image" to fall back to the runner's LLVM.
+  CONCORD_LLVM_VERSION: ${{ inputs.llvm_version || vars.CONCORD_LLVM_VERSION || '22.1.3' }}
+  BUILD_DIR: build/clang-cl-x64-release
+  CONFIGURATION: Release
+
+jobs:
+  build:
+    name: Build + package
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Source repository guard
+        # Project-owned check: refuses tracked game assets, build outputs and
+        # oversized blobs before any compilation starts.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\Check-SourceRepository.ps1 -TrackedOnly
+          if ($LASTEXITCODE -ne 0) { throw "Source repository guard failed (exit $LASTEXITCODE)" }
+
+      - name: Cache pinned LLVM
+        if: env.CONCORD_LLVM_VERSION != 'image'
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: D:\llvm-${{ env.CONCORD_LLVM_VERSION }}
+          key: llvm-${{ env.CONCORD_LLVM_VERSION }}-win64-msvc-v1
+
+      - name: Resolve toolchain
+        # Writes LLVM_ROOT / CMAKE_EXE / NINJA_EXE / MSVC_ROOT / SDK_ROOT /
+        # SDK_VERSION / MSVC_COMPAT_VERSION into the job environment.
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Set-JobEnv([string]$Name, [string]$Value) {
+            if ([string]::IsNullOrWhiteSpace($Value)) { throw "Empty value for $Name" }
+            $utf8 = New-Object System.Text.UTF8Encoding($false)
+            [IO.File]::AppendAllText($env:GITHUB_ENV, "$Name=$Value`n", $utf8)
+            Write-Host "$Name = $Value"
+          }
+
+          # --- LLVM -----------------------------------------------------------
+          if ($env:CONCORD_LLVM_VERSION -eq 'image') {
+            $clangCli = Get-Command clang-cl.exe -ErrorAction SilentlyContinue
+            if (-not $clangCli) { throw 'Runner LLVM requested but clang-cl.exe is not on PATH.' }
+            $llvmRoot = Split-Path -Parent (Split-Path -Parent $clangCli.Source)
+          } else {
+            $version = $env:CONCORD_LLVM_VERSION
+            $llvmRoot = "D:\llvm-$version"
+            if (-not (Test-Path (Join-Path $llvmRoot 'bin\clang-cl.exe'))) {
+              $asset = "clang+llvm-$version-x86_64-pc-windows-msvc.tar.xz"
+              $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$asset"
+              $archive = Join-Path $env:RUNNER_TEMP $asset
+              Write-Host "Downloading $url"
+              & curl.exe -L --fail --retry 3 --retry-delay 5 -o $archive $url
+              if ($LASTEXITCODE -ne 0) { throw "LLVM $version download failed: $url" }
+              New-Item -ItemType Directory -Force -Path $llvmRoot | Out-Null
+              & tar.exe -xf $archive -C $llvmRoot --strip-components 1
+              if ($LASTEXITCODE -ne 0) { throw "LLVM $version extraction failed: $archive" }
+              Remove-Item -LiteralPath $archive -Force
+            }
+          }
+          foreach ($tool in @('clang-cl.exe', 'lld-link.exe', 'llvm-lib.exe', 'llvm-readobj.exe')) {
+            $path = Join-Path $llvmRoot "bin\$tool"
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "LLVM is missing $tool under $llvmRoot" }
+          }
+
+          # --- CMake / Ninja (image-provided, minimum version enforced) -------
+          $cmake = (Get-Command cmake.exe -ErrorAction SilentlyContinue).Source
+          if (-not $cmake) { throw 'cmake.exe not found on PATH; this workflow expects the hosted Windows image.' }
+          $cmakeVersion = ([version]((& $cmake --version)[0] -replace '^cmake version ')).ToString()
+          if ([version]$cmakeVersion -lt [version]'3.20') { throw "CMake $cmakeVersion is older than the required 3.20" }
+
+          $ninja = (Get-Command ninja.exe -ErrorAction SilentlyContinue).Source
+          if (-not $ninja) {
+            Write-Host 'ninja.exe missing; installing the pinned Chocolatey package.'
+            choco install ninja -y --no-progress | Out-Host
+            $ninja = (Get-Command ninja.exe -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $ninja) { throw 'ninja.exe could not be located.' }
+
+          # --- Microsoft C++ toolset and Windows SDK --------------------------
+          # Discovered, never assumed: image updates change both versions.
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw 'vswhere.exe not found; no VS-family C++ tools to discover.' }
+          $vsPath = @(& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) | Select-Object -First 1
+          if (-not $vsPath) { throw 'No complete MSVC x86/x64 toolset installation was found.' }
+          $vsPath = $vsPath.Trim()
+
+          $toolsRoot = Join-Path $vsPath 'VC\Tools\MSVC'
+          $toolset = Get-ChildItem -LiteralPath $toolsRoot -Directory |
+            Where-Object {
+              $_.Name -match '^\d+\.\d+\.\d+$' -and
+              (Test-Path (Join-Path $_.FullName 'include\vector')) -and
+              (Test-Path (Join-Path $_.FullName 'lib\x64')) -and
+              (Test-Path (Join-Path $_.FullName 'lib\x86'))
+            } |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1
+          if (-not $toolset) { throw "No usable MSVC toolset (x64+x86) under $toolsRoot" }
+          $msvcRoot = $toolset.FullName
+
+          # 14.44.35207 -> 19.44.35207, matching the cl.exe compatibility contract.
+          $toolsetVersion = [version]$toolset.Name
+          $compatVersion = "19.$($toolsetVersion.Minor).$($toolsetVersion.Build)"
+
+          $sdkRoot = $null
+          foreach ($candidate in @((Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'), (Join-Path $env:ProgramFiles 'Windows Kits\10'))) {
+            if (Test-Path -LiteralPath (Join-Path $candidate 'Include')) { $sdkRoot = $candidate; break }
+          }
+          if (-not $sdkRoot) { throw 'Windows 10/11 SDK root not found.' }
+
+          $sdkVersion = Get-ChildItem -LiteralPath (Join-Path $sdkRoot 'Include') -Directory |
+            Where-Object {
+              $inc = $_.FullName
+              $ver = $_.Name
+              ($ver -match '^\d+\.\d+\.\d+(\.\d+)?$') -and
+              (@(@('ucrt', 'shared', 'um', 'winrt', 'cppwinrt') | Where-Object { -not (Test-Path (Join-Path $inc $_)) }).Count -eq 0) -and
+              (Test-Path (Join-Path $sdkRoot "bin\$ver\x64\rc.exe")) -and
+              (Test-Path (Join-Path $sdkRoot "bin\$ver\x64\mt.exe"))
+            } |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1
+          if (-not $sdkVersion) { throw "No Windows SDK with rc.exe/mt.exe and the required include set under $sdkRoot" }
+
+          Set-JobEnv 'LLVM_ROOT' $llvmRoot
+          Set-JobEnv 'CMAKE_EXE' $cmake
+          Set-JobEnv 'NINJA_EXE' $ninja
+          Set-JobEnv 'MSVC_ROOT' $msvcRoot
+          Set-JobEnv 'SDK_ROOT' $sdkRoot
+          Set-JobEnv 'SDK_VERSION' $sdkVersion.Name
+          Set-JobEnv 'MSVC_COMPAT_VERSION' $compatVersion
+
+          # Recorded verbatim in the job summary and inside the package.
+          $identity = @(
+            "LLVM request: $env:CONCORD_LLVM_VERSION",
+            "LLVM root: $llvmRoot",
+            "CMake: $cmakeVersion ($cmake)",
+            "Ninja: $((& $ninja --version)) ($ninja)",
+            "MSVC toolset: $($toolset.Name)",
+            "MSVC compat version: $compatVersion",
+            "Windows SDK: $($sdkVersion.Name)",
+            "PowerShell: $($PSVersionTable.PSVersion)"
+          )
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "TOOLCHAIN_IDENTITY<<CONCORD_EOF`n$($identity -join "`n")`nCONCORD_EOF`n", $utf8)
+          $identity | ForEach-Object { Write-Host $_ }
+
+      - name: Preflight system dependency check
+        # New-ClangStage resolves every PE import against System32/SysWOW64 and
+        # fails late if a system DLL is absent. Surface that early instead.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $required = @('winmm.dll', 'ws2_32.dll', 'bcrypt.dll', 'secur32.dll', 'crypt32.dll',
+                        'comdlg32.dll', 'xaudio2_9.dll', 'ole32.dll')
+          $missing = @()
+          foreach ($dll in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\$dll"))) { $missing += $dll }
+          }
+          if ($missing.Count) {
+            Write-Warning ("System DLLs not present on this runner: " + ($missing -join ', '))
+            Write-Warning 'The link step may still succeed but staging verifies imports; expect a late failure.'
+          } else {
+            Write-Host 'All system dependencies referenced by the link line are present.'
+          }
+
+      - name: Build (Release, staged only)
+        # -StageOnly builds, verifies architecture/imports/CRT/SHA-256 and produces
+        # an isolated deployment-stage directory. Nothing is written to bin/.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Explicit string argv: splatting a hashtable into a native executable
+          # would split the -StageOnly switch into '-StageOnly' + 'True'.
+          $argv = @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'tools\Build-Game.ps1',
+            '-BuildDirectory', $env:BUILD_DIR,
+            '-Configuration', $env:CONFIGURATION,
+            '-CMakeExecutable', $env:CMAKE_EXE,
+            '-NinjaExecutable', $env:NINJA_EXE,
+            '-LLVMRoot', $env:LLVM_ROOT,
+            '-MSVCRoot', $env:MSVC_ROOT,
+            '-WindowsSDKRoot', $env:SDK_ROOT,
+            '-WindowsSDKVersion', $env:SDK_VERSION,
+            '-MSVCCompatibilityVersion', $env:MSVC_COMPAT_VERSION,
+            '-StageOnly'
+          )
+          & powershell @argv
+          if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE)" }
+
+      - name: Package build result
+        id: package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stageRoot = Join-Path $env:BUILD_DIR 'deployment-stage'
+          $stage = Get-ChildItem -LiteralPath $stageRoot -Directory |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $stage) { throw "No staged deployment under $stageRoot" }
+
+          $provenance = Join-Path $stage.FullName 'build-provenance.json'
+          if (-not (Test-Path -LiteralPath $provenance)) { throw "Missing build-provenance.json in $($stage.FullName)" }
+
+          # Re-verify the two products independently of the build script.
+          $x64 = Join-Path $stage.FullName 'concord_runtime.exe'
+          $x86 = Join-Path $stage.FullName 'BinkFrameExtractor.exe'
+          foreach ($pair in @(@($x64, 0x8664), @($x86, 0x014c))) {
+            $file = $pair[0]
+            if (-not (Test-Path -LiteralPath $file)) { throw "Missing build product: $file" }
+            $stream = [IO.File]::OpenRead($file)
+            $reader = New-Object IO.BinaryReader($stream)
+            try {
+              if ($reader.ReadUInt16() -ne 0x5a4d) { throw "Not a PE image: $file" }
+              $stream.Position = 0x3c
+              $offset = $reader.ReadInt32()
+              $stream.Position = $offset
+              [void]$reader.ReadUInt32()
+              $machine = $reader.ReadUInt16()
+            } finally { $reader.Dispose(); $stream.Dispose() }
+            if ($machine -ne $pair[1]) { throw ("Unexpected PE machine 0x{0:x4} in {1}" -f $machine, $file) }
+          }
+
+          # "out/" is already excluded by the project .gitignore.
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'out'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $zipName = "ConcordRTS-$($env:GITHUB_SHA.Substring(0, 12))-windows-x64.zip"
+          $zip = Join-Path $dist $zipName
+          Compress-Archive -Path (Join-Path $stage.FullName '*') -DestinationPath $zip -Force
+
+          $manifest = Get-Content -LiteralPath $provenance -Raw | ConvertFrom-Json
+          $info = @(
+            'ConcordRTS prebuilt package',
+            '',
+            "Repository : $env:GITHUB_REPOSITORY",
+            "Commit     : $env:GITHUB_SHA",
+            "Ref        : $env:GITHUB_REF",
+            "Built at   : $((Get-Date).ToUniversalTime().ToString('o'))",
+            '',
+            'Toolchain',
+            $env:TOOLCHAIN_IDENTITY,
+            '',
+            'Contents (name / SHA-256)'
+          )
+          $info += @($manifest.files | ForEach-Object { '  ' + $_.name + '  ' + $_.sha256 })
+          $info += @('', 'This package contains engine binaries and Microsoft CRT redistributables only.')
+          $info += @('Original RA2/YR game data, Binkw32.dll and retail assets are NOT included and must be supplied locally.')
+          $infoPath = Join-Path $dist 'BUILD-INFO.txt'
+          [IO.File]::WriteAllLines($infoPath, $info, (New-Object Text.UTF8Encoding($false)))
+
+          Copy-Item -LiteralPath $provenance -Destination (Join-Path $dist 'build-provenance.json') -Force
+
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "ZIP_NAME=$zipName`n")
+
+          Write-Host "Package: $zip"
+          Get-ChildItem -LiteralPath $dist | ForEach-Object { Write-Host ("  {0}  {1:N0} bytes" -f $_.Name, $_.Length) }
+          $manifest.files | ForEach-Object { Write-Host ("  {0}  {1}" -f $_.name, $_.sha256) }
+
+      - name: Run asset-free regression tests
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./tools/testing/Run-LocalTests.ps1 `
+              -Compiler Clang `
+              -BuildDirectory $env:BUILD_DIR `
+              -Configuration $env:CONFIGURATION `
+              -Profile windows-minimal
+          if ($LASTEXITCODE -ne 0) { throw "windows-minimal test profile failed (exit $LASTEXITCODE)" }
+
+      - name: Collect test results
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.run_tests)
+        run: |
+          if (-not (Test-Path -LiteralPath 'build\local-tests')) { Write-Host 'No test run directory.'; return }
+          $run = Get-ChildItem -LiteralPath 'build\local-tests' -Directory |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $results = Join-Path $run.FullName 'results.json'
+          if (-not (Test-Path -LiteralPath $results)) { Write-Host "No results.json in $($run.FullName)"; return }
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "TEST_RESULTS_DIR=$($run.FullName)`n")
+          $report = Get-Content -LiteralPath $results -Raw | ConvertFrom-Json
+          $line = "passed={0} failed={1} skipped={2} not-built={3} not-run={4}" -f `
+            $report.counts.passed, $report.counts.failed, $report.counts.skipped, $report.counts.'not-built', $report.counts.'not-run'
+          Write-Host $line
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "TEST_SUMMARY=$line`n")
+
+      - name: Upload build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: concord-windows-x64
+          path: |
+            out/*.zip
+            out/BUILD-INFO.txt
+            out/build-provenance.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload test evidence
+        if: always() && env.TEST_RESULTS_DIR != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: concord-test-results
+          path: ${{ env.TEST_RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write job summary
+        if: always()
+        run: |
+          $lines = @()
+          $lines += '### ConcordRTS - Windows x64 (clang-cl + Ninja)'
+          $lines += ''
+          $lines += '| Item | Value |'
+          $lines += '| --- | --- |'
+          $lines += '| Commit | ' + $env:GITHUB_SHA + ' |'
+          $lines += '| Ref | ' + $env:GITHUB_REF + ' |'
+          $lines += '| Runner | ' + $env:RUNNER_OS + ' / ' + $env:RUNNER_ARCH + ' |'
+          $lines += '| Build directory | ' + $env:BUILD_DIR + ' |'
+          if ($env:LLVM_ROOT) {
+            $lines += '| LLVM | ' + $env:LLVM_ROOT + ' |'
+            $lines += '| CMake | ' + $env:CMAKE_EXE + ' |'
+            $lines += '| Ninja | ' + $env:NINJA_EXE + ' |'
+            $lines += '| MSVC toolset | ' + $env:MSVC_ROOT + ' |'
+            $lines += '| MSVC compat | ' + $env:MSVC_COMPAT_VERSION + ' |'
+            $lines += '| Windows SDK | ' + $env:SDK_VERSION + ' |'
+          }
+          if ($env:ZIP_NAME) { $lines += '| Package | ' + $env:ZIP_NAME + ' |' }
+          if ($env:TEST_SUMMARY) { $lines += '| Tests (windows-minimal) | ' + $env:TEST_SUMMARY + ' |' }
+          $lines += ''
+          $lines += 'Deployment staging performs its own PE architecture, import-resolution, CRT and SHA-256 checks; the package contains `build-provenance.json` with the full command and source-hash record.'
+          [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ($lines -join "`n") + "`n")
+
+  release:
+    name: Publish release assets
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@v4
+        with:
+          name: concord-windows-x64
+          path: out
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $zip = Get-ChildItem -LiteralPath 'out' -Filter *.zip | Select-Object -First 1
+          if (-not $zip) { throw 'No package zip was downloaded.' }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag exists; uploading the asset with --clobber."
+            gh release upload $tag $zip.FullName --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            gh release create $tag $zip.FullName --repo $env:GITHUB_REPOSITORY --title $tag --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Release publishing failed (exit $LASTEXITCODE)" }
