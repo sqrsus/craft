@@ -180,6 +180,14 @@ jobs:
               if ($fields.Length -lt 3 -or $fields[0] -eq '160000') { continue }  # gitlink = submodule
               [void]$blobs.Add($fields[1])
             }
+            # A filtered (promisor) clone keeps blobs out of the object database
+            # and fetches them on demand; any probe that fails to trigger a lazy
+            # fetch then reports "<sha> missing". Reject it outright.
+            $promisor = (& git -C $Path config --get remote.origin.promisor) -join ''
+            if ($promisor.Trim() -eq 'true') {
+              $defects.Add('the clone is filtered (promisor remote), so blob metadata is not available locally')
+              return ,$defects
+            }
             # Tracked files absent from the working tree are detected by git
             # itself, which keeps path decoding out of this script.
             $deleted = @(& git -C $Path diff-files --name-only --diff-filter=D)
@@ -361,31 +369,58 @@ jobs:
         # but two properties make it unsuitable as a build gate here:
         #   - it inspects upstream content, which this workflow cannot change;
         #   - it reads blob sizes through `git cat-file`, so it aborts with
-        #     "<sha> missing" whenever the object database is not complete,
-        #     which has nothing to do with compilation.
-        # Both the file list and the object database are already verified by the
-        # fetch step, so findings here are reported as warnings and the build
-        # continues. Make this fatal again by replacing the warning below with
-        # a throw.
+        #     "<sha> missing" whenever the object database cannot serve that
+        #     probe, which has nothing to do with compilation.
+        # Findings are therefore reported as warnings plus a dump of the Git
+        # state that explains them, and the step always exits 0. The native exit
+        # code has to be cleared explicitly: otherwise the failing child
+        # process becomes this step's verdict even though nothing threw.
         run: |
           $ErrorActionPreference = 'Stop'
           $guard = Join-Path $env:PROJECT_ROOT 'tools\Check-SourceRepository.ps1'
           if (-not (Test-Path -LiteralPath $guard -PathType Leaf)) {
             Write-Warning 'tools\Check-SourceRepository.ps1 is not present in this snapshot; skipping the repository hygiene guard.'
-            return
+            exit 0
           }
           if (-not (Test-Path -LiteralPath (Join-Path $env:PROJECT_ROOT '.git'))) {
             Write-Warning 'Source tree has no Git index (not a clone); skipping the repository hygiene guard.'
-            return
+            exit 0
           }
+
           & powershell -NoProfile -ExecutionPolicy Bypass -File $guard -ProjectRoot $env:PROJECT_ROOT -TrackedOnly
-          $code = $LASTEXITCODE
-          if ($code -eq 0) {
+          $guardExit = $LASTEXITCODE
+          $LASTEXITCODE = 0
+          if ($guardExit -eq 0) {
             Write-Host 'Repository hygiene guard passed.'
-          } else {
-            Write-Warning "Repository hygiene guard reported issues (exit $code). This concerns upstream content that the build cannot fix, so it is advisory and compilation continues."
-            [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ":warning: Repository hygiene guard reported issues (exit $code); the build continued.`n")
+            exit 0
           }
+
+          Write-Warning "Repository hygiene guard reported issues (exit $guardExit). This concerns upstream content that the build cannot fix, so it is advisory and compilation continues."
+          Write-Host ''
+          Write-Host 'Git state behind that report:'
+          $ErrorActionPreference = 'Continue'   # the probes below are expected to fail
+          $src = $env:PROJECT_ROOT
+          Write-Host ('  HEAD               : ' + (& git -C $src rev-parse HEAD))
+          Write-Host ('  shallow clone      : ' + (& git -C $src rev-parse --is-shallow-repository))
+          Write-Host ('  promisor remote    : ' + ((& git -C $src config --get remote.origin.promisor) -join ''))
+          Write-Host ('  partial clone      : ' + ((& git -C $src config --get remote.origin.partialclonefilter) -join ''))
+          $entries = @(& git -C $src ls-files --stage)
+          Write-Host ('  index entries      : ' + $entries.Count)
+          $objects = @(& git -C $src cat-file --batch-all-objects --batch-check='%(objectname)')
+          Write-Host ('  objects enumerated : ' + $objects.Count)
+          $probe = @($entries | ForEach-Object {
+              $tab = $_.IndexOf("`t")
+              if ($tab -gt 0) { ($_.Substring(0, $tab) -split ' ')[1] }
+            } | Where-Object { $_ } | Select-Object -First 10)
+          $readable = 0
+          foreach ($sha in $probe) {
+            & git -C $src cat-file -e $sha 2>$null
+            if ($LASTEXITCODE -eq 0) { $readable++ }
+          }
+          Write-Host ('  cat-file -e probe  : ' + $readable + '/' + $probe.Count + ' sampled index blobs readable')
+          foreach ($line in @(& git -C $src count-objects -v)) { Write-Host ('    ' + $line) }
+          [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ":warning: Repository hygiene guard reported issues (exit $guardExit); the build continued.`n")
+          exit 0
 
       - name: Cache pinned LLVM
         if: env.CONCORD_LLVM_VERSION != 'image'
