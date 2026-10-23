@@ -422,10 +422,10 @@ jobs:
           [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ":warning: Repository hygiene guard reported issues (exit $guardExit); the build continued.`n")
           exit 0
 
-      - name: Cache pinned LLVM
+      - name: Restore pinned LLVM cache
         if: env.CONCORD_LLVM_VERSION != 'image'
         id: llvm-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: D:\llvm-${{ env.CONCORD_LLVM_VERSION }}
           key: llvm-${{ env.CONCORD_LLVM_VERSION }}-win64-msvc-v1
@@ -433,6 +433,12 @@ jobs:
       - name: Resolve toolchain
         # Writes LLVM_ROOT / CMAKE_EXE / NINJA_EXE / MSVC_ROOT / SDK_ROOT /
         # SDK_VERSION / MSVC_COMPAT_VERSION into the job environment.
+        #
+        # A cache miss downloads an 822 MB .tar.xz and expands it to roughly
+        # 3.6 GB. That is minutes of work on a single thread, so the extraction
+        # runs as a monitored child process with a heartbeat: otherwise the step
+        # looks hung for the whole time.
+        timeout-minutes: 45
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -459,8 +465,39 @@ jobs:
               & curl.exe -L --fail --retry 3 --retry-delay 5 -o $archive $url
               if ($LASTEXITCODE -ne 0) { throw "LLVM $version download failed: $url" }
               New-Item -ItemType Directory -Force -Path $llvmRoot | Out-Null
-              & tar.exe -xf $archive -C $llvmRoot --strip-components 1
-              if ($LASTEXITCODE -ne 0) { throw "LLVM $version extraction failed: $archive" }
+              # Single-threaded xz decode with no output of its own: run it as a
+              # child process and print a heartbeat so the step never looks dead.
+              $extractClock = [Diagnostics.Stopwatch]::StartNew()
+              $start = New-Object Diagnostics.ProcessStartInfo
+              $start.FileName = (Get-Command tar.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+              $start.Arguments = '-xf "{0}" -C "{1}" --strip-components 1' -f $archive, $llvmRoot
+              $start.UseShellExecute = $false
+              $start.CreateNoWindow = $true
+              $start.RedirectStandardOutput = $true
+              $start.RedirectStandardError = $true
+              $tar = New-Object Diagnostics.Process
+              $tar.StartInfo = $start
+              [void]$tar.Start()
+              $tarStdout = $tar.StandardOutput.ReadToEndAsync()
+              $tarStderr = $tar.StandardError.ReadToEndAsync()
+              while (-not $tar.WaitForExit(15000)) {
+                $written = 0
+                try {
+                  $sum = ([IO.Directory]::EnumerateFiles($llvmRoot, '*', [IO.SearchOption]::AllDirectories) |
+                    ForEach-Object { (New-Object IO.FileInfo $_).Length } | Measure-Object -Sum).Sum
+                  if ($sum) { $written = [math]::Round($sum / 1MB) }
+                } catch { }
+                Write-Host ('  extracting: {0,4:N0} s elapsed, {1,6:N0} MB written' -f $extractClock.Elapsed.TotalSeconds, $written)
+              }
+              $tar.WaitForExit()
+              $tarExit = $tar.ExitCode
+              $tarOutText = $tarStdout.GetAwaiter().GetResult()
+              $tarErrText = $tarStderr.GetAwaiter().GetResult()
+              $tar.Dispose()
+              if ($tarOutText) { Write-Host $tarOutText }
+              if ($tarErrText) { Write-Host $tarErrText }
+              if ($tarExit -ne 0) { throw "LLVM $version extraction failed (exit $tarExit): $archive" }
+              Write-Host ('  extracted in {0:N0} s' -f $extractClock.Elapsed.TotalSeconds)
               Remove-Item -LiteralPath $archive -Force
             }
           }
@@ -549,6 +586,16 @@ jobs:
           $utf8 = New-Object System.Text.UTF8Encoding($false)
           [IO.File]::AppendAllText($env:GITHUB_ENV, "TOOLCHAIN_IDENTITY<<CONCORD_EOF`n$($identity -join "`n")`nCONCORD_EOF`n", $utf8)
           $identity | ForEach-Object { Write-Host $_ }
+
+      - name: Save pinned LLVM cache
+        # actions/cache only saves on job success, so a build that fails later
+        # would pay for the 822 MB download and extraction again on every retry.
+        # Saving right after a successful resolve makes iterations cheap.
+        if: env.CONCORD_LLVM_VERSION != 'image' && steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: D:\llvm-${{ env.CONCORD_LLVM_VERSION }}
+          key: llvm-${{ env.CONCORD_LLVM_VERSION }}-win64-msvc-v1
 
       - name: Preflight system dependency check
         # New-ClangStage resolves every PE import against System32/SysWOW64 and
