@@ -50,8 +50,9 @@ env:
   # Pinned to the project's validated release. Override with a repository variable
   # or a manual dispatch input; use "image" to fall back to the runner's LLVM.
   CONCORD_LLVM_VERSION: ${{ inputs.llvm_version || vars.CONCORD_LLVM_VERSION || '22.1.3' }}
-  BUILD_DIR: build/clang-cl-x64-release
   CONFIGURATION: Release
+  # PROJECT_ROOT and BUILD_DIR are derived by the "Validate project layout" step:
+  # no path in this workflow relies on the runner's current directory.
 
 jobs:
   build:
@@ -64,12 +65,115 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Source repository guard
-        # Project-owned check: refuses tracked game assets, build outputs and
-        # oversized blobs before any compilation starts.
+      - name: Validate project layout
+        # Resolves PROJECT_ROOT and BUILD_DIR and fails with a readable report
+        # before any tool is downloaded. Two failure modes are possible when a
+        # source snapshot is committed by hand: the tree is stored one level
+        # below the workspace root, or parts of it (tools/, cmake/) are absent.
+        # Both used to surface only as a cryptic "-File ... does not exist".
         run: |
           $ErrorActionPreference = 'Stop'
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools\Check-SourceRepository.ps1 -TrackedOnly
+
+          function Set-JobEnv([string]$Name, [string]$Value) {
+            if ([string]::IsNullOrWhiteSpace($Value)) { throw "Empty value for $Name" }
+            $utf8 = New-Object System.Text.UTF8Encoding($false)
+            [IO.File]::AppendAllText($env:GITHUB_ENV, "$Name=$Value`n", $utf8)
+            Write-Host "$Name = $Value"
+          }
+
+          $workspace = $env:GITHUB_WORKSPACE
+          Write-Host "GITHUB_WORKSPACE = $workspace"
+          Write-Host "Current location = $(Get-Location)"
+
+          $markers = @('CMakeLists.txt', 'cmake\GameTargets.cmake', 'tools\Build-Game.ps1')
+          function Test-ProjectRoot([string]$Path) {
+            foreach ($marker in $markers) {
+              if (-not (Test-Path -LiteralPath (Join-Path $Path $marker) -PathType Leaf)) { return $false }
+            }
+            return $true
+          }
+
+          # Workspace root first, then its direct, non-hidden children.
+          $candidates = @($workspace)
+          $candidates += @(
+            Get-ChildItem -LiteralPath $workspace -Directory -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -notlike '.*' } |
+              ForEach-Object { $_.FullName }
+          )
+          $found = @($candidates | Where-Object { Test-ProjectRoot $_ } | Select-Object -Unique)
+
+          if ($found.Count -eq 0) {
+            Write-Host ''
+            Write-Host 'Workspace root contents:'
+            Get-ChildItem -LiteralPath $workspace -Force |
+              Sort-Object PSIsContainer -Descending |
+              ForEach-Object { Write-Host ('  {0} {1}' -f $(if ($_.PSIsContainer) { '[dir] ' } else { '[file]' }), $_.Name) }
+            Write-Host ''
+            Write-Host 'Required project markers that were not found:'
+            foreach ($marker in $markers) {
+              $hit = @($candidates | Where-Object { Test-Path -LiteralPath (Join-Path $_ $marker) -PathType Leaf })
+              if ($hit.Count -eq 0) { Write-Host "  - $marker" }
+            }
+            $detail = "Source tree not found. Expected $($markers -join ', ') at $workspace " +
+                      'or in one of its immediate subdirectories. ' +
+                      'The checked-out commit does not contain a complete ConcordRTS source snapshot; ' +
+                      'commit the whole tree (CMakeLists.txt, cmake/, tools/, src/) instead of a partial copy.'
+            throw $detail
+          }
+          if ($found.Count -gt 1) {
+            Write-Warning ("Multiple source trees matched; using the first: " + ($found -join ' | '))
+          }
+          $projectRoot = $found[0]
+          Write-Host "PROJECT_ROOT  = $projectRoot"
+
+          $required = @(
+            'CMakeLists.txt',
+            'cmake\GameTargets.cmake',
+            'cmake\VideoBridge.cmake',
+            'cmake\CompilerContract.cmake',
+            'tools\Build-Game.ps1',
+            'tools\toolchain\Build-WindowsClang.ps1',
+            'tools\toolchain\ClangBuildSupport.ps1',
+            'tools\toolchain\Configure-WindowsClang.ps1'
+          )
+          $optional = @(
+            'tools\Check-SourceRepository.ps1',
+            'tools\testing\Run-LocalTests.ps1'
+          )
+
+          $missing = @()
+          foreach ($rel in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $projectRoot $rel) -PathType Leaf)) { $missing += $rel }
+          }
+          if ($missing.Count) {
+            $detail = 'Source snapshot is incomplete. Missing: ' + ($missing -join ', ') +
+                      '. The build entry points are part of the project, not of this workflow.'
+            throw $detail
+          }
+          foreach ($rel in $optional) {
+            if (-not (Test-Path -LiteralPath (Join-Path $projectRoot $rel) -PathType Leaf)) {
+              Write-Warning "Optional project script absent from this snapshot: $rel"
+            }
+          }
+
+          $buildDir = Join-Path $projectRoot 'build\clang-cl-x64-release'
+          Set-JobEnv 'PROJECT_ROOT' $projectRoot
+          Set-JobEnv 'BUILD_DIR' $buildDir
+          [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, "Project root: ``$projectRoot`` (validated)`n")
+
+      - name: Source repository guard
+        # Project-owned check: refuses tracked game assets, build outputs and
+        # oversized blobs before any compilation starts. It is a hygiene gate,
+        # not part of the compiler contract, so a snapshot that predates the
+        # script still builds (with a warning) instead of failing here.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $guard = Join-Path $env:PROJECT_ROOT 'tools\Check-SourceRepository.ps1'
+          if (-not (Test-Path -LiteralPath $guard -PathType Leaf)) {
+            Write-Warning 'tools\Check-SourceRepository.ps1 is not present in this snapshot; skipping the repository hygiene guard.'
+            return
+          }
+          & powershell -NoProfile -ExecutionPolicy Bypass -File $guard -ProjectRoot $env:PROJECT_ROOT -TrackedOnly
           if ($LASTEXITCODE -ne 0) { throw "Source repository guard failed (exit $LASTEXITCODE)" }
 
       - name: Cache pinned LLVM
@@ -226,7 +330,8 @@ jobs:
           # Explicit string argv: splatting a hashtable into a native executable
           # would split the -StageOnly switch into '-StageOnly' + 'True'.
           $argv = @(
-            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'tools\Build-Game.ps1',
+            '-NoProfile', '-ExecutionPolicy', 'Bypass',
+            '-File', (Join-Path $env:PROJECT_ROOT 'tools\Build-Game.ps1'),
             '-BuildDirectory', $env:BUILD_DIR,
             '-Configuration', $env:CONFIGURATION,
             '-CMakeExecutable', $env:CMAKE_EXE,
@@ -312,7 +417,15 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          & ./tools/testing/Run-LocalTests.ps1 `
+          $runner = Join-Path $env:PROJECT_ROOT 'tools\testing\Run-LocalTests.ps1'
+          if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) {
+            Write-Warning 'tools\testing\Run-LocalTests.ps1 is not present in this snapshot; skipping the test profile.'
+            return
+          }
+          # Reset so a stale value from an earlier native command cannot mask a
+          # script that exits 0 without running anything.
+          $LASTEXITCODE = 0
+          & $runner `
               -Compiler Clang `
               -BuildDirectory $env:BUILD_DIR `
               -Configuration $env:CONFIGURATION `
@@ -322,8 +435,11 @@ jobs:
       - name: Collect test results
         if: always() && (github.event_name != 'workflow_dispatch' || inputs.run_tests)
         run: |
-          if (-not (Test-Path -LiteralPath 'build\local-tests')) { Write-Host 'No test run directory.'; return }
-          $run = Get-ChildItem -LiteralPath 'build\local-tests' -Directory |
+          # Run-LocalTests resolves a relative OutputDirectory against the project
+          # root (not the current directory), so read it back from there.
+          $testRoot = Join-Path $env:PROJECT_ROOT 'build\local-tests'
+          if (-not (Test-Path -LiteralPath $testRoot)) { Write-Host 'No test run directory.'; return }
+          $run = Get-ChildItem -LiteralPath $testRoot -Directory |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
           $results = Join-Path $run.FullName 'results.json'
           if (-not (Test-Path -LiteralPath $results)) { Write-Host "No results.json in $($run.FullName)"; return }
@@ -366,6 +482,7 @@ jobs:
           $lines += '| Commit | ' + $env:GITHUB_SHA + ' |'
           $lines += '| Ref | ' + $env:GITHUB_REF + ' |'
           $lines += '| Runner | ' + $env:RUNNER_OS + ' / ' + $env:RUNNER_ARCH + ' |'
+          $lines += '| Project root | ' + $env:PROJECT_ROOT + ' |'
           $lines += '| Build directory | ' + $env:BUILD_DIR + ' |'
           if ($env:LLVM_ROOT) {
             $lines += '| LLVM | ' + $env:LLVM_ROOT + ' |'
