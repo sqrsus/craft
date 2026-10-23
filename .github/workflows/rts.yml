@@ -472,6 +472,90 @@ jobs:
             New-Object psobject -Property @{ Files = $count; Bytes = $bytes; Error = $errorText }
           }
 
+          function Invoke-MonitoredExtraction {
+            # Runs an extractor as a child process and reports progress, because
+            # both candidates (bsdtar, python tarfile) print nothing useful for
+            # minutes at a time. Two independent signals decide "working":
+            #   - bytes/files appearing under the target (I/O),
+            #   - the child's own CPU time (decode work).
+            # A strategy that never starts is abandoned after StartGraceSeconds
+            # instead of burning the whole step budget.
+            param(
+              [string]$Label,
+              [Diagnostics.ProcessStartInfo]$StartInfo,
+              [string]$Target,
+              [int]$StartGraceSeconds = 60,
+              [int]$IdleSeconds = 300
+            )
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $proc = New-Object Diagnostics.Process
+            $proc.StartInfo = $StartInfo
+            [void]$proc.Start()
+            $stdout = $proc.StandardOutput.ReadToEndAsync()
+            $stderr = $proc.StandardError.ReadToEndAsync()
+            $lastBytes = [int64]0
+            $lastCpu = -1.0
+            $idleBeats = 0
+            $sawProgress = $false
+            $stopReason = $null
+            while (-not $proc.WaitForExit(10000)) {
+              $usage = Get-TreeUsage $Target
+              $cpu = -1.0
+              try {
+                $proc.Refresh()
+                if (-not $proc.HasExited) { $cpu = $proc.TotalProcessorTime.TotalSeconds }
+              } catch { }
+              # Progress is bytes under the target, or CPU time that actually
+              # grew. The first usable CPU reading only establishes a baseline:
+              # comparing it against the -1 sentinel would treat a permanently
+              # idle child (cpu = 0) as progress on its very first heartbeat.
+              $moved = $false
+              if ($usage.Bytes -gt $lastBytes) { $moved = $true }
+              if ($cpu -ge 0) {
+                if ($lastCpu -lt 0) { $lastCpu = $cpu }
+                elseif ($cpu -gt ($lastCpu + 0.5)) { $moved = $true; $lastCpu = $cpu }
+              }
+              if ($moved) { $idleBeats = 0; $sawProgress = $true } else { $idleBeats++ }
+              $lastBytes = $usage.Bytes
+              $cpuText = if ($cpu -lt 0) { '   n/a' } else { '{0,6:N0}' -f $cpu }
+              $note = ''
+              if ($usage.Error) { $note = '  [probe: ' + $usage.Error + ']' }
+              Write-Host ('  {0}: {1,4:N0} s, cpu {2} s, {3,5:N0} files, {4,7:N0} MB{5}' -f `
+                  $Label, $clock.Elapsed.TotalSeconds, $cpuText, $usage.Files, ($usage.Bytes / 1MB), $note)
+              if ((-not $sawProgress) -and ($clock.Elapsed.TotalSeconds -ge $StartGraceSeconds)) {
+                $stopReason = "produced nothing in $([int]$clock.Elapsed.TotalSeconds) s"
+                break
+              }
+              if (($idleBeats * 10) -ge $IdleSeconds) {
+                $stopReason = "stopped progressing for $($idleBeats * 10) s"
+                break
+              }
+            }
+            if ($stopReason) {
+              try { $proc.Kill() } catch { }
+            } else {
+              $proc.WaitForExit()
+            }
+            $code = $proc.ExitCode
+            $outText = $stdout.GetAwaiter().GetResult()
+            $errText = $stderr.GetAwaiter().GetResult()
+            $proc.Dispose()
+            if ($outText) { Write-Host $outText }
+            if ($errText) { Write-Host $errText }
+            $final = Get-TreeUsage $Target
+            Write-Host ('  {0}: exit {1} after {2:N0} s -> {3:N0} files, {4:N0} MB' -f `
+                $Label, $code, $clock.Elapsed.TotalSeconds, $final.Files, ($final.Bytes / 1MB))
+            New-Object psobject -Property @{
+              Label   = $Label
+              Ok      = ((-not $stopReason) -and ($code -eq 0) -and ($final.Files -gt 0))
+              Reason  = $stopReason
+              Exit    = $code
+              Files   = $final.Files
+              Bytes   = $final.Bytes
+              Seconds = [int]$clock.Elapsed.TotalSeconds
+            }
+          }
+
           # --- LLVM -----------------------------------------------------------
           if ($env:CONCORD_LLVM_VERSION -eq 'image') {
             $clangCli = Get-Command clang-cl.exe -ErrorAction SilentlyContinue
@@ -488,78 +572,102 @@ jobs:
               & curl.exe -L --fail --retry 3 --retry-delay 5 -o $archive $url
               if ($LASTEXITCODE -ne 0) { throw "LLVM $version download failed: $url" }
               New-Item -ItemType Directory -Force -Path $llvmRoot | Out-Null
-              # bsdtar decodes xz on a single thread and prints nothing until it
-              # exits, so it is driven as a child process with a heartbeat.
-              # Two independent signals are reported, because a size probe alone
-              # cannot tell "working" from "stuck":
-              #   - bytes/files under the target directory (I/O progress),
-              #   - the tar process' own CPU time (decode progress).
+              # Two extractors are tried in order. Python goes first because it
+              # is preinstalled on the hosted Windows image and measured at the
+              # same speed as bsdtar (65 s vs 69 s for 4,477 files / 3.9 GB),
+              # while bsdtar on some images starts, consumes no CPU and writes
+              # nothing however long it is left running (observed: 310 s, zero
+              # bytes). A method that never gets going is abandoned after a grace
+              # period and the next one is used, instead of spending the build
+              # budget on a dead extractor.
               $extractClock = [Diagnostics.Stopwatch]::StartNew()
-              $start = New-Object Diagnostics.ProcessStartInfo
-              $start.FileName = (Get-Command tar.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-              # The destination is passed as the working directory instead of
-              # "-C <path>": a misparsed quoted argument would silently extract
-              # into the current directory, leaving the target empty while tar
-              # happily keeps working.
-              $start.WorkingDirectory = $llvmRoot
-              $start.Arguments = '-xf "{0}" --strip-components 1' -f $archive
-              $start.UseShellExecute = $false
-              $start.CreateNoWindow = $true
-              $start.RedirectStandardOutput = $true
-              $start.RedirectStandardError = $true
-              Write-Host ('  extractor: {0} -> {1}' -f $start.FileName, $llvmRoot)
-              $tar = New-Object Diagnostics.Process
-              $tar.StartInfo = $start
-              [void]$tar.Start()
-              $tarStdout = $tar.StandardOutput.ReadToEndAsync()
-              $tarStderr = $tar.StandardError.ReadToEndAsync()
 
-              $lastBytes = [int64]0
-              $lastCpu = -1.0
-              $idleBeats = 0
-              while (-not $tar.WaitForExit(10000)) {
-                $usage = Get-TreeUsage $llvmRoot
-                $cpu = -1.0
-                try {
-                  $tar.Refresh()
-                  if (-not $tar.HasExited) { $cpu = $tar.TotalProcessorTime.TotalSeconds }
-                } catch { }
-                if (($usage.Bytes -gt $lastBytes) -or ($cpu -gt $lastCpu + 0.5)) { $idleBeats = 0 } else { $idleBeats++ }
-                $lastBytes = $usage.Bytes
-                $lastCpu = $cpu
-                $note = ''
-                if ($usage.Error) { $note = '  [probe: ' + $usage.Error + ']' }
-                Write-Host ('  extracting: {0,4:N0} s, tar CPU {1,5:N0} s, {2,5:N0} files, {3,7:N0} MB{4}' -f `
-                    $extractClock.Elapsed.TotalSeconds, [math]::Max($cpu, 0), $usage.Files, ($usage.Bytes / 1MB), $note)
-                if ($idleBeats -ge 30) {
-                  # 5 minutes with neither I/O nor CPU movement: it is not slow,
-                  # it is stuck. Fail with context instead of waiting for the
-                  # 45 minute step timeout.
-                  try { $tar.Kill() } catch { }
-                  $partial = Get-TreeUsage $llvmRoot
-                  $top = @(Get-ChildItem -LiteralPath $llvmRoot -Force -ErrorAction SilentlyContinue | Select-Object -First 20 -ExpandProperty Name)
-                  throw ("LLVM extraction stopped making progress for " + ($idleBeats * 10) + " s" +
-                         " (tar CPU " + [math]::Round([math]::Max($cpu, 0)) + " s, " + $partial.Files + " files, " +
-                         [math]::Round($partial.Bytes / 1MB) + " MB)." +
-                         " Target listing: " + ($top -join ', ') +
-                         ". Free space on D: " + [math]::Round((Get-PSDrive D).Free / 1GB, 1) + ' GB.')
+              # Python is preinstalled on the hosted Windows image. The tool
+              # cache is preferred over PATH because "python.exe" can resolve to
+              # the Microsoft Store alias on some images.
+              $python = $env:CONCORD_PYTHON
+              if (-not $python) {
+                $python = (Get-ChildItem -LiteralPath 'C:\hostedtoolcache\windows\Python' -Filter python.exe -Recurse -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -notlike '*\Scripts\*' } | Select-Object -First 1).FullName
+              }
+              if (-not $python) { $python = (Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source }
+              if ($python) { Write-Host "  python fallback: $python" } else { Write-Warning 'No python.exe found; the bsdtar fallback chain is reduced to tar.exe alone.' }
+
+              # tarfile with lzma, extracting one level down to drop the
+              # clang+llvm-<version> top directory, and reporting progress from
+              # inside the child so a stalled extraction is visible even if the
+              # parent's size probe misbehaves.
+              $pyScript = Join-Path $env:RUNNER_TEMP 'concord-extract.py'
+              $pyCode = @(
+                'import os, sys, tarfile'
+                'archive, dest = sys.argv[1], sys.argv[2]'
+                'if not os.path.isdir(dest):'
+                '    os.makedirs(dest)'
+                'count = 0'
+                'skipped = 0'
+                # Python 3.14 turns on extraction filtering by default, which can
+                # silently drop members; request it explicitly where supported so
+                # today's behaviour does not change unnoticed later.
+                'use_filter = hasattr(tarfile, "data_filter")'
+                'with tarfile.open(archive, "r:xz") as tf:'
+                '    for member in tf:'
+                '        parts = member.name.replace("\\", "/").split("/")'
+                '        if len(parts) < 2: continue'
+                '        member.name = "/".join(parts[1:])'
+                '        try:'
+                '            if use_filter: tf.extract(member, dest, filter="data")'
+                '            else: tf.extract(member, dest)'
+                '        except Exception as exc:'
+                '            skipped += 1'
+                '            if skipped <= 5: print("  python: skipped %s (%s)" % (member.name, exc), flush=True)'
+                '            continue'
+                '        count += 1'
+                '        if count % 250 == 0: print("  python: %d files extracted" % count, flush=True)'
+                'print("  python: %d files extracted, %d skipped" % (count, skipped), flush=True)'
+              )
+              Set-Content -LiteralPath $pyScript -Value ($pyCode -join "`n") -Encoding ascii
+
+              $extracted = $false
+              $attempts = New-Object System.Collections.Generic.List[string]
+              foreach ($method in @('python', 'tar')) {
+                if ($method -eq 'python' -and -not $python) { continue }
+                if (Test-Path -LiteralPath $llvmRoot) { Remove-Item -LiteralPath $llvmRoot -Recurse -Force }
+                New-Item -ItemType Directory -Force -Path $llvmRoot | Out-Null
+                $start = New-Object Diagnostics.ProcessStartInfo
+                $start.UseShellExecute = $false
+                $start.CreateNoWindow = $true
+                $start.RedirectStandardOutput = $true
+                $start.RedirectStandardError = $true
+                if ($method -eq 'tar') {
+                  $start.FileName = (Get-Command tar.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+                  # Destination as the working directory, not "-C <path>": a
+                  # misparsed quoted argument would silently expand elsewhere
+                  # while tar reports nothing at all.
+                  $start.WorkingDirectory = $llvmRoot
+                  $start.Arguments = '-xf "{0}" --strip-components 1' -f $archive
+                } else {
+                  $start.FileName = $python
+                  $start.Arguments = '"{0}" "{1}" "{2}"' -f $pyScript, $archive, $llvmRoot
                 }
+                Write-Host ('  extractor: {0} -> {1}' -f $start.FileName, $llvmRoot)
+
+                $result = Invoke-MonitoredExtraction -Label $method -StartInfo $start -Target $llvmRoot -StartGraceSeconds 90 -IdleSeconds 300
+                $usable = $result.Ok -and (Test-Path -LiteralPath (Join-Path $llvmRoot 'bin\clang-cl.exe') -PathType Leaf)
+                $why = 'exit ' + $result.Exit
+                if ($result.Reason) { $why = $result.Reason }
+                # Built with -f, not "$method: ...": inside a double-quoted
+                # string a bare "<var>:" is parsed as a scoped variable.
+                [void]$attempts.Add(('{0}: {1}, {2} files, {3} MB in {4} s' -f `
+                    $method, $why, $result.Files, [math]::Round($result.Bytes / 1MB), $result.Seconds))
+                if ($usable) { $extracted = $true; break }
+                Write-Warning ("Extraction via $method was not usable ($why); trying the next method.")
               }
-              $tar.WaitForExit()
-              $tarExit = $tar.ExitCode
-              $tarOutText = $tarStdout.GetAwaiter().GetResult()
-              $tarErrText = $tarStderr.GetAwaiter().GetResult()
-              $tar.Dispose()
-              if ($tarOutText) { Write-Host $tarOutText }
-              if ($tarErrText) { Write-Host $tarErrText }
-              if ($tarExit -ne 0) { throw "LLVM $version extraction failed (exit $tarExit): $archive" }
-              $final = Get-TreeUsage $llvmRoot
-              Write-Host ('  extracted in {0:N0} s: {1:N0} files, {2:N0} MB' -f `
-                  $extractClock.Elapsed.TotalSeconds, $final.Files, ($final.Bytes / 1MB))
-              if ($final.Files -eq 0) {
-                throw ("tar reported success but $llvmRoot is still empty, so the archive was expanded " +
-                       "somewhere else (extraction cwd: " + $start.WorkingDirectory + ').')
+              if (-not $extracted) {
+                throw ("LLVM $version could not be extracted from $archive. Attempts: " + ($attempts -join ' | ') +
+                       '; archive ' + [math]::Round((Get-Item -LiteralPath $archive).Length / 1MB, 1) +
+                       ' MB; free space on D: ' + [math]::Round((Get-PSDrive D).Free / 1GB, 1) + ' GB.')
               }
+              Write-Host ('  extracted in {0:N0} s' -f $extractClock.Elapsed.TotalSeconds)
               Remove-Item -LiteralPath $archive -Force
             }
           }
