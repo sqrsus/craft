@@ -1,0 +1,17 @@
+name: Cleanup old workflow runs
+on:
+  schedule:
+    - cron: '17 4 * * *'  # 每周一 UTC 04:17，避开整点
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: igorjs/gh-actions-clean-workflow@v8
+        with:
+          runs_older_than: 3    # 删除 7 天前的
+          runs_to_keep: 3      # 每个工作流至少保留最近 10 次
