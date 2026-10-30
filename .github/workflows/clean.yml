@@ -1,17 +1,265 @@
-name: Cleanup old workflow runs
+# =============================================================================
+#  GitHub Actions 运行记录 / artifacts 自动清理工作流
+# -----------------------------------------------------------------------------
+#  作用
+#    对仓库内「每一个」工作流，仅保留最近 KEEP 次（默认 3 次）运行记录，
+#    更早的运行记录连同其 artifacts 与日志一并删除。
+#
+#  原理
+#    GitHub 的 DELETE /repos/{owner}/{repo}/actions/runs/{run_id} 接口在删除
+#    运行记录时会「级联删除」该次运行产生的全部 artifacts 与日志，因此主体
+#    逻辑只需删除 run；末尾的 artifacts 过期清理为可选兜底（默认关闭）。
+#
+#  部署
+#    1. 把本文件放到仓库的 .github/workflows/ 目录下（如 cleanup-runs.yml）；
+#    2. 提交到默认分支后即生效（schedule 定时触发只在默认分支上运行）；
+#    3. 无需 checkout 代码，纯 REST API 操作，执行开销极小。
+#
+#  首次验证
+#    Actions 页面 → 本工作流 → Run workflow → 先把 dry_run 设为 true 预演一遍，
+#    确认日志中「将删除」的清单符合预期后，再关闭 dry_run 正式执行。
+# =============================================================================
+
+name: Cleanup Actions Runs and Artifacts
+
+# ---------------------------------------------------------------------------
+# 触发方式：每日定时 + 手动触发
+#   - cron 使用 UTC 时区。'0 18 * * *' = UTC 18:00 = 北京时间次日 02:00，
+#     避开工作日高峰，减少与正常构建的并发冲突。
+#   - workflow_dispatch 提供参数覆盖能力，便于临时调整保留策略或预演。
+# ---------------------------------------------------------------------------
 on:
   schedule:
-    - cron: '17 4 * * *'  # 每周一 UTC 04:17，避开整点
+    - cron: '0 18 * * *'
   workflow_dispatch:
+    inputs:
+      keep:
+        description: '每个工作流保留的最近运行次数（默认 3，最小 1）'
+        required: false
+        type: string
+        default: '3'
+      dry_run:
+        description: '预演模式：只打印将被删除的对象，不真正删除'
+        required: false
+        type: boolean
+        default: false
+      artifact_max_age_days:
+        description: '兜底清理：删除创建时间超过 N 天的 artifacts（0 = 关闭该逻辑）'
+        required: false
+        type: string
+        default: '0'
+      max_run_pages:
+        description: '每个工作流最多回溯的页数（每页 100 条运行记录，防止无限翻页）'
+        required: false
+        type: string
+        default: '20'
+
+# ---------------------------------------------------------------------------
+# 权限声明：删除运行记录与 artifacts 需要 actions: write。
+# 采用最小权限原则，不授予 contents / packages 等无关权限。
+# ---------------------------------------------------------------------------
+permissions:
+  actions: write
+
+# ---------------------------------------------------------------------------
+# 并发控制：同一时间只允许一个清理任务，避免两次执行重复删除同一批对象
+# 从而触发 404 与二级速率限制。不取消进行中的任务，保证本次清理跑完。
+# ---------------------------------------------------------------------------
+concurrency:
+  group: cleanup-actions-runs
+  cancel-in-progress: false
 
 jobs:
   cleanup:
+    name: Prune old workflow runs
     runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
+    timeout-minutes: 30
+
+    # 通过环境变量向脚本传参：脚本内部不直接使用 ${{ }} 表达式，避免注入风险
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      KEEP: ${{ github.event.inputs.keep || '3' }}
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      ARTIFACT_MAX_AGE_DAYS: ${{ github.event.inputs.artifact_max_age_days || '0' }}
+      MAX_RUN_PAGES: ${{ github.event.inputs.max_run_pages || '20' }}
+
     steps:
-      - uses: igorjs/gh-actions-clean-workflow@v8
-        with:
-          runs_older_than: 3    # 删除 7 天前的
-          runs_to_keep: 3      # 每个工作流至少保留最近 10 次
+      # =====================================================================
+      # 步骤 1：回显本次清理参数，便于事后审计每次执行的策略
+      # =====================================================================
+      - name: 步骤 1 · 输出清理参数
+        shell: bash
+        run: |
+          echo "仓库:           ${REPO}"
+          echo "保留次数 KEEP:  ${KEEP}"
+          echo "预演 DRY_RUN:   ${DRY_RUN}"
+          echo "Artifacts 兜底: ${ARTIFACT_MAX_AGE_DAYS} 天（0 = 关闭）"
+          echo "回溯页数上限:   ${MAX_RUN_PAGES}"
+
+      # =====================================================================
+      # 步骤 2：核心清理逻辑
+      #   a) 枚举仓库内全部工作流；
+      #   b) 逐个工作流按创建时间倒序拉取运行记录，前 KEEP 条保留；
+      #   c) 其余记录逐条 DELETE（连带删除 artifacts 与日志）；
+      #   d) 可选兜底：删除存活时间超过阈值的 artifacts。
+      # =====================================================================
+      - name: 步骤 2 · 清理历史运行记录与 artifacts
+        shell: bash
+        run: |
+          # 注意：这里刻意不使用 set -e。单条删除失败（如已被并发删除、被限流）
+          # 不应中断整批清理，改为计数并在结尾汇总告警。
+          set -uo pipefail
+
+          DELETED_RUNS=0
+          DELETED_ARTIFACTS=0
+          FAILED=0
+
+          log() { printf '[%s] %s\n' "$(date -u '+%H:%M:%SZ')" "$*"; }
+
+          # ---- 参数合法性校验 -------------------------------------------------
+          [[ "${KEEP}" =~ ^[0-9]+$ ]] || { log "错误: KEEP 必须是非负整数，当前值: ${KEEP}"; exit 1; }
+          if (( KEEP < 1 )); then
+            # 保留 0 次会把「当前正在运行的本工作流」也标记为待删，风险过高
+            log "错误: KEEP 至少为 1（当前值 ${KEEP}）"
+            exit 1
+          fi
+          [[ "${MAX_RUN_PAGES}" =~ ^[0-9]+$ ]] || { log "错误: MAX_RUN_PAGES 必须是非负整数"; exit 1; }
+          [[ "${ARTIFACT_MAX_AGE_DAYS}" =~ ^[0-9]+$ ]] || { log "错误: ARTIFACT_MAX_AGE_DAYS 必须是非负整数"; exit 1; }
+
+          gh auth status >/dev/null 2>&1 || { log "错误: gh 未完成认证，请检查 GH_TOKEN 与 permissions"; exit 1; }
+
+          # ---- 拉取单个工作流的运行记录（按创建时间倒序，第 1 条为最新） ------
+          # 每页 100 条，最多回溯 MAX_RUN_PAGES 页，避免大仓库无限翻页拖垮任务
+          fetch_runs() {
+            local wf_id="$1" page=1 out count
+            while (( page <= MAX_RUN_PAGES )); do
+              out=$(gh api "repos/${REPO}/actions/workflows/${wf_id}/runs?per_page=100&page=${page}" \
+                      --jq '.workflow_runs[] | "\(.id)\t\(.status)\t\(.created_at)"' 2>/dev/null) || return 0
+              [[ -z "${out}" ]] && return 0
+              printf '%s\n' "${out}"
+              count=$(printf '%s\n' "${out}" | wc -l | tr -d ' ')
+              (( count < 100 )) && return 0
+              page=$(( page + 1 ))
+            done
+            log "  提示: 已达回溯页数上限 (${MAX_RUN_PAGES} 页)，更早的记录留待下次执行处理"
+          }
+
+          # 记录「被保留」的 run id，供 artifacts 兜底逻辑做白名单判断
+          declare -A RETAINED=()
+
+          # ---- a) 枚举全部工作流（含已禁用的） ---------------------------------
+          mapfile -t WF_ROWS < <(
+            gh api --paginate "repos/${REPO}/actions/workflows?per_page=100" \
+              --jq '.workflows[] | "\(.id)\t\(.name)"' 2>/dev/null
+          )
+
+          if (( ${#WF_ROWS[@]} == 0 )); then
+            log "未发现任何工作流，跳过运行记录清理"
+          else
+            # ---- b) 逐个工作流执行保留 + 删除 ----------------------------------
+            while IFS=$'\t' read -r wf_id wf_name; do
+              [[ -z "${wf_id:-}" ]] && continue
+              log "=== 工作流: ${wf_name} (id=${wf_id}) ==="
+
+              RUN_ROWS=$(fetch_runs "${wf_id}")
+
+              idx=0
+              while IFS=$'\t' read -r run_id run_status run_created; do
+                [[ -z "${run_id:-}" ]] && continue
+
+                # 前 KEEP 条（最新）直接保留，登记进白名单
+                if (( idx < KEEP )); then
+                  RETAINED["${run_id}"]=1
+                  idx=$(( idx + 1 ))
+                  continue
+                fi
+
+                # 排队中 / 运行中的记录跳过：避免误删正在执行的构建，
+                # 也避免把本工作流自身的当前这次运行删掉
+                case "${run_status}" in
+                  in_progress|queued|waiting|requested|pending)
+                    log "  跳过（状态 ${run_status}）: run ${run_id}"
+                    continue
+                    ;;
+                esac
+
+                if [[ "${DRY_RUN}" == "true" ]]; then
+                  log "  [DRY-RUN] 将删除 run ${run_id}（创建于 ${run_created}）及其 artifacts"
+                  continue
+                fi
+
+                # 单条删除：失败只计数不中断，常见原因为已被并发删除或触发限流
+                if gh api -X DELETE "repos/${REPO}/actions/runs/${run_id}" >/dev/null 2>&1; then
+                  log "  已删除 run ${run_id}（创建于 ${run_created}）"
+                  DELETED_RUNS=$(( DELETED_RUNS + 1 ))
+                else
+                  log "  !! 删除 run ${run_id} 失败（可能已不存在、权限不足或被限流）"
+                  FAILED=$(( FAILED + 1 ))
+                fi
+
+                # 节流：DELETE 属于写操作，GitHub 对写请求有约 80 次/分钟的二级
+                # 速率限制，每秒 1 次的节奏可稳定落在阈值内，避免 403 中断
+                sleep 1
+              done < <(printf '%s\n' "${RUN_ROWS}")
+            done < <(printf '%s\n' "${WF_ROWS[@]}")
+          fi
+
+          # ---- c) 可选兜底：清理存活过久的 artifacts ---------------------------
+          # 正常情况下删除 run 已级联删除 artifacts；该逻辑只用于处理历史遗留的
+          # 孤儿产物。默认关闭（ARTIFACT_MAX_AGE_DAYS=0），避免误删保留记录的产物。
+          # 注意：过滤使用 gh 内置的 --jq（内置 gojq），不依赖 runner 上的外部 jq。
+          if (( ARTIFACT_MAX_AGE_DAYS > 0 )); then
+            log "=== 兜底清理: 创建超过 ${ARTIFACT_MAX_AGE_DAYS} 天的 artifacts ==="
+            cutoff=$(date -u -d "-${ARTIFACT_MAX_AGE_DAYS} days" '+%Y-%m-%dT%H:%M:%SZ')
+            art_filter='.artifacts[] | select(.created_at < "'"${cutoff}"'") | "\(.id)\t\(.name)\t\(.created_at)\t\(.workflow_run.id // 0)"'
+            ART_ROWS=$(gh api --paginate "repos/${REPO}/actions/artifacts?per_page=100" \
+              --jq "${art_filter}" 2>/dev/null) || ART_ROWS=""
+
+            while IFS=$'\t' read -r art_id art_name art_created art_run_id; do
+              [[ -z "${art_id:-}" ]] && continue
+
+              # 白名单保护：属于「最近 KEEP 次运行」的产物一律不动
+              if [[ -n "${RETAINED[${art_run_id}]:-}" ]]; then
+                log "  跳过（属于保留的 run ${art_run_id}）: artifact ${art_id}（${art_name}）"
+                continue
+              fi
+
+              if [[ "${DRY_RUN}" == "true" ]]; then
+                log "  [DRY-RUN] 将删除 artifact ${art_id}（${art_name}，创建于 ${art_created}）"
+                continue
+              fi
+
+              if gh api -X DELETE "repos/${REPO}/actions/artifacts/${art_id}" >/dev/null 2>&1; then
+                log "  已删除 artifact ${art_id}（${art_name}）"
+                DELETED_ARTIFACTS=$(( DELETED_ARTIFACTS + 1 ))
+              else
+                log "  !! 删除 artifact ${art_id} 失败"
+                FAILED=$(( FAILED + 1 ))
+              fi
+              sleep 1
+            done < <(printf '%s\n' "${ART_ROWS}")
+          fi
+
+          # ---- d) 汇总输出：写入 Job Summary，便于在 Actions 页面直接查看 -----
+          {
+            echo "## Actions 清理结果"
+            echo ""
+            echo "| 指标 | 数量 |"
+            echo "| --- | --- |"
+            echo "| 删除的运行记录 | ${DELETED_RUNS} |"
+            echo "| 删除的 artifacts | ${DELETED_ARTIFACTS} |"
+            echo "| 删除失败 | ${FAILED} |"
+            echo ""
+            echo "- 每个工作流保留最近 **${KEEP}** 次运行"
+            echo "- 预演模式：**${DRY_RUN}**"
+            echo "- Artifacts 兜底阈值：**${ARTIFACT_MAX_AGE_DAYS}** 天（0 = 关闭）"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          log "完成: 删除 run ${DELETED_RUNS} 条, artifact ${DELETED_ARTIFACTS} 个, 失败 ${FAILED} 个"
+
+          # 失败项以注释形式标记，但不让整个 Job 失败（多为并发删除造成的 404）
+          if (( FAILED > 0 )); then
+            echo "::warning::本次共有 ${FAILED} 个对象删除失败，请查看上方日志确认原因"
+          fi
+          echo "::notice::清理完成，保留策略为每个工作流最近 ${KEEP} 次运行"
