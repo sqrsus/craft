@@ -58,7 +58,7 @@ on:
       keep:
         description: '每个工作流保留的最近运行次数（默认 3，最小 1）'
         required: false
-        default: '3'
+        default: '2'
         type: string
       dry_run:
         description: '预演模式：只打印将删除的对象，不真正删除'
